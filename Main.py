@@ -1,23 +1,33 @@
 import hmac
 import hashlib
 import time
+import json
+import logging
+import os
+from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
-from typing import Optional
+
+# Configure Structured JSON Logging for Security Audits
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+)
+logger = logging.getLogger("PostGuard-NG")
 
 app = FastAPI(
     title="PostGuard NG Security Gateway",
-    description="API Middleware protecting NIPOST National Alphanumeric Postcode Infrastructure",
-    version="1.0.0"
+    description="Enterprise API Middleware protecting NIPOST National Alphanumeric Postcode Infrastructure",
+    version="1.1.0"
 )
 
-# Secret shared with registered enterprise clients (e.g., Logistics / Fintech partners)
-CLIENT_SECRET_KEY = b"super-secret-partner-key-3mtt"
-
-# In-memory rate limiting store (For production, swap this out for Redis)
-request_counts = {}
+# Configuration (In production, load these from environment variables)
+CLIENT_SECRET_KEY = os.getenv("POSTGUARD_CLIENT_SECRET", "super-secret-partner-key-3mtt").encode()
 RATE_LIMIT_WINDOW = 60  # seconds
-MAX_REQUESTS_PER_WINDOW = 5  # strict limit for demo purposes
+MAX_REQUESTS_PER_WINDOW = 10  # strict sliding window limit
+
+# In-memory rate limiting store (Swap for Redis in production scaling)
+request_counts = {}
 
 class PostcodeQuery(BaseModel):
     postcode: str = Field(..., example="FC 02 A09 DB 09", description="11-character NIPOST Alphanumeric Code")
@@ -26,17 +36,17 @@ class PostcodeQuery(BaseModel):
     declared_region: str = Field(..., example="Abuja", description="State or LGA user claims to be in")
 
 def verify_hmac_signature(payload_body: bytes, received_sig: str) -> bool:
-    """Verifies that the request payload has not been tampered with mid-transit."""
+    """Cryptographic verification to prevent Man-in-the-Middle payload tampering."""
     computed_sig = hmac.new(CLIENT_SECRET_KEY, payload_body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(computed_sig, received_sig)
 
 def check_rate_limit(client_id: str) -> bool:
-    """Simple sliding-window rate limiter to block DDoS and volumetric scraping."""
+    """Sliding-window rate limiter to mitigate volumetric scraping and DDoS."""
     current_time = time.time()
     if client_id not in request_counts:
         request_counts[client_id] = []
     
-    # Filter timestamps within the current window
+    # Prune expired timestamps
     request_counts[client_id] = [t for t in request_counts[client_id] if current_time - t < RATE_LIMIT_WINDOW]
     
     if len(request_counts[client_id]) >= MAX_REQUESTS_PER_WINDOW:
@@ -53,11 +63,13 @@ async def secure_postcode_query(
     x_client_id: Optional[str] = Header(None, alias="X-Client-ID")
 ):
     """
-    Secure proxy endpoint that intercepts, sanitizes, and evaluates postcode queries 
-    before forwarding them to NIPOST's backend infrastructure.
+    Secure interceptor proxy that screens, validates, and protects NIPOST backend endpoints.
     """
-    # 1. Check API Client Identification Header
+    client_ip = request.client.host
+
+    # 1. Validate Client Identification Header
     if not x_client_id:
+        logger.warning(json.dumps({"event": "UNAUTHORIZED_ACCESS", "ip": client_ip, "reason": "Missing Client ID"}))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing X-Client-ID header."
@@ -65,42 +77,55 @@ async def secure_postcode_query(
 
     # 2. Enforce Rate Limiting
     if not check_rate_limit(x_client_id):
+        logger.error(json.dumps({"event": "RATE_LIMIT_EXCEEDED", "client_id": x_client_id, "ip": client_ip}))
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Rate limit exceeded. Potential volumetric attack or scraping blocked by PostGuard NG."
+            detail="Rate limit exceeded. Volumetric scraping attempt blocked by PostGuard NG."
         )
 
     # 3. Verify HMAC Payload Signature
     raw_body = await request.body()
     if not x_postguard_signature or not verify_hmac_signature(raw_body, x_postguard_signature):
+        logger.critical(json.dumps({"event": "PAYLOAD_TAMPERING_DETECTED", "client_id": x_client_id, "ip": client_ip}))
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid or missing HMAC-SHA256 signature. Request payload tampering detected."
+            detail="Invalid or missing HMAC signature. Request integrity compromised."
         )
 
-    # 4. Geo-Behavioral Anomaly & Spoofing Check (Mock logic for demo)
-    # E.g., If someone claims to be in Lagos (Lat ~6.5) but queries an Abuja postcode (FC 02...)
-    if query.postcode.startswith("FC") and query.declared_region.lower() != "abuja":
+    # 4. Geo-Behavioral Anomaly & Anti-Spoofing Check
+    if query.postcode.startswith("FC") and query.declared_region.lower() not in ["abuja", "fct"]:
+        logger.warning(json.dumps({
+            "event": "LOCATION_SPOOFING_BLOCKED", 
+            "client_id": x_client_id, 
+            "postcode": query.postcode, 
+            "declared_region": query.declared_region
+        }))
         return {
             "status": "BLOCKED",
             "threat_detected": "LOCATION_SPOOFING",
-            "message": "Geospatial mismatch detected. Client metadata does not align with the requested NIPOST postcode zone."
+            "message": "Geospatial mismatch detected. Client telemetry does not align with the requested NIPOST postcode zone."
         }
 
-    # 5. Passed all security checks -> Forward to NIPOST API (Mocked successful proxy response)
+    # 5. Success: Forwarded to NIPOST Backend Infrastructure (Mock Proxy Response)
+    logger.info(json.dumps({"event": "REQUEST_PASSED", "client_id": x_client_id, "postcode": query.postcode}))
     return {
         "status": "SUCCESS",
         "security_score": "100%",
+        "shield": "PostGuard NG Active",
         "postcode": query.postcode,
         "resolved_data": {
-            "state": "Federal Capital Territory",
-            "lga": "Municipal Area Council",
-            "building_status": "Verified Active",
-            "gis_precision": "11-character Alphanumeric Grid Verified"
+            "region": query.declared_region,
+            "building_status": "Verified Active Grid",
+            "gis_precision": "11-character Alphanumeric Verified"
         },
-        "message": "Request successfully authenticated and scrubbed by PostGuard NG."
+        "message": "Request successfully authenticated, scrubbed, and proxied."
     }
 
 @app.get("/health")
 def health_check():
-    return {"system": "PostGuard NG Firewall", "status": "Operational", "target": "docs.postcode.gov.ng"}
+    return {
+        "system": "PostGuard NG Security Gateway",
+        "status": "Operational",
+        "target_infrastructure": "docs.postcode.gov.ng",
+        "protection_active": ["HMAC-SHA256", "Token Bucket Rate Limiter", "Geo-Behavioral Engine"]
+    }
