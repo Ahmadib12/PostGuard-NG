@@ -38,5 +38,5 @@ PostGuard NG acts as an intelligent shield at the edge, intercepting, scrubbing,
 
 ### 1. Clone the Repository
 ```bash
-git clone [https://github.com/your-username/postguard-ng.git](https://github.com/your-username/postguard-ng.git)
+git clone [https://github.com/ahmadib12/postguard-ng.git](https://github.com/ahmadinejad12/postguard-ng.git)
 cd postguard-ng
