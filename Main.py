@@ -7,6 +7,11 @@ import os
 from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
+import httpx
+from dotenv import load_dotenv
+
+# Load local .env file variables
+load_dotenv()
 
 # Configure Structured JSON Logging for Security Audits
 logging.basicConfig(
@@ -18,11 +23,14 @@ logger = logging.getLogger("PostGuard-NG")
 app = FastAPI(
     title="PostGuard NG Security Gateway",
     description="Enterprise API Middleware protecting NIPOST National Alphanumeric Postcode Infrastructure",
-    version="1.1.0"
+    version="1.2.0"
 )
 
-# Configuration (In production, load these from environment variables)
+# Configuration from Environment Variables
 CLIENT_SECRET_KEY = os.getenv("POSTGUARD_CLIENT_SECRET", "super-secret-partner-key-3mtt").encode()
+NIPOST_API_KEY = os.getenv("NIPOST_API_KEY")  # Your official key from dashboard.postcode.gov.ng
+NIPOST_BASE_URL = "https://api.postcode.gov.ng/v1"
+
 RATE_LIMIT_WINDOW = 60  # seconds
 MAX_REQUESTS_PER_WINDOW = 10  # strict sliding window limit
 
@@ -30,7 +38,8 @@ MAX_REQUESTS_PER_WINDOW = 10  # strict sliding window limit
 request_counts = {}
 
 class PostcodeQuery(BaseModel):
-    postcode: str = Field(..., example="FC 02 A09 DB 09", description="11-character NIPOST Alphanumeric Code")
+    postcode: str = Field(..., example="FC-03-B06-AG-12", description="11-character NIPOST Alphanumeric Code")
+    level: int = Field(1, example=3, description="Lookup detail level (1 to 3/5)")
     client_lat: float = Field(..., example=9.05785, description="Client device latitude")
     client_lon: float = Field(..., example=7.49508, description="Client device longitude")
     declared_region: str = Field(..., example="Abuja", description="State or LGA user claims to be in")
@@ -63,7 +72,8 @@ async def secure_postcode_query(
     x_client_id: Optional[str] = Header(None, alias="X-Client-ID")
 ):
     """
-    Secure interceptor proxy that screens, validates, and protects NIPOST backend endpoints.
+    Secure interceptor proxy that screens requests, runs anti-spoofing checks, 
+    and securely proxies to NIPOST API using hidden backend credentials.
     """
     client_ip = request.client.host
 
@@ -106,19 +116,40 @@ async def secure_postcode_query(
             "message": "Geospatial mismatch detected. Client telemetry does not align with the requested NIPOST postcode zone."
         }
 
-    # 5. Success: Forwarded to NIPOST Backend Infrastructure (Mock Proxy Response)
-    logger.info(json.dumps({"event": "REQUEST_PASSED", "client_id": x_client_id, "postcode": query.postcode}))
+    # 5. Passed Edge Security: Forward securely upstream to NIPOST API using hidden server-side key
+    if not NIPOST_API_KEY:
+        raise HTTPException(status_code=500, detail="Server misconfiguration: NIPOST API Key not set in environment.")
+
+    nipost_url = f"{NIPOST_BASE_URL}/lookup?code={query.postcode}&level={query.level}"
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            nipost_response = await client.get(
+                nipost_url,
+                headers={"X-API-Key": NIPOST_API_KEY},
+                timeout=10.0
+            )
+        except httpx.RequestError as exc:
+            logger.error(json.dumps({"event": "UPSTREAM_CONNECTION_ERROR", "error": str(exc)}))
+            raise HTTPException(status_code=502, detail="Failed to connect to NIPOST infrastructure backend.")
+
+    # Handle upstream errors from NIPOST gracefully
+    if nipost_response.status_code != 200:
+        return {
+            "status": "UPSTREAM_ERROR",
+            "shield": "PostGuard NG Active",
+            "nipost_status_code": nipost_response.status_code,
+            "error_details": nipost_response.json()
+        }
+
+    # 6. Success: Return sanitized response back to client with security badge
+    logger.info(json.dumps({"event": "REQUEST_PASSED_AND_PROXIED", "client_id": x_client_id, "postcode": query.postcode}))
+    
     return {
         "status": "SUCCESS",
         "security_score": "100%",
-        "shield": "PostGuard NG Active",
-        "postcode": query.postcode,
-        "resolved_data": {
-            "region": query.declared_region,
-            "building_status": "Verified Active Grid",
-            "gis_precision": "11-character Alphanumeric Verified"
-        },
-        "message": "Request successfully authenticated, scrubbed, and proxied."
+        "shield": "PostGuard NG Firewall Active",
+        "nipost_data": nipost_response.json()
     }
 
 @app.get("/health")
@@ -126,6 +157,6 @@ def health_check():
     return {
         "system": "PostGuard NG Security Gateway",
         "status": "Operational",
-        "target_infrastructure": "docs.postcode.gov.ng",
-        "protection_active": ["HMAC-SHA256", "Token Bucket Rate Limiter", "Geo-Behavioral Engine"]
+        "target_infrastructure": "https://api.postcode.gov.ng",
+        "protection_active": ["HMAC-SHA256", "Token Bucket Rate Limiter", "Geo-Behavioral Engine", "Secure Server-Side Upstream Proxy"]
     }
