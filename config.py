@@ -27,20 +27,18 @@ class Settings:
     rate_limit_per_minute: int = int(os.getenv("RATE_LIMIT_PER_MINUTE", "10"))
 
     # Client policy (demo; replace with DB-backed tenant/auth model)
-    client_policy: Dict[str, Dict[str, object]] = field(
-        default_factory=lambda: {
-            "demo-client": {
-                "allowed_regions": ["abuja", "fct", "lagos"],
-                "max_level": 2,
-                "rate_limit_per_minute": 10,
-            },
-            "partner-x": {
-                "allowed_regions": ["abuja", "fct"],
-                "max_level": 3,
-                "rate_limit_per_minute": 20,
-            },
-        }
-    )
+    client_policy: Dict[str, Dict[str, object]] = field(default_factory=lambda: {
+        "demo-client": {
+            "allowed_regions": ["abuja", "fct", "lagos"],
+            "max_level": 2,
+            "rate_limit_per_minute": 10,
+        },
+        "partner-x": {
+            "allowed_regions": ["abuja", "fct"],
+            "max_level": 3,
+            "rate_limit_per_minute": 20,
+        },
+    })
 
     @property
     def required(self) -> List[str]:
