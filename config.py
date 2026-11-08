@@ -9,7 +9,11 @@ load_dotenv()
 
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name, str(default)).strip().lower()
-    return value in {"1", "true", "yes", "on"}
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be one of: true, false, 1, 0, yes, no, on, off.")
 
 
 def _env_positive_int(name: str, default: int) -> int:

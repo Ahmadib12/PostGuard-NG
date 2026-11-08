@@ -16,7 +16,7 @@ import httpx
 from fastapi import HTTPException
 
 import security
-from config import settings
+from config import _env_bool, settings
 from security import (
     _RATE_LIMIT_SCRIPT,
     check_rate_limit,
@@ -112,7 +112,20 @@ class SecurityCoreTests(unittest.TestCase):
 
     def test_geo_anomaly_is_advisory_only(self):
         self.assertEqual(detect_geo_anomaly("FC-03-B06-AG-12", "Abuja", 9.1, 7.1), None)
-        self.assertEqual(detect_geo_anomaly("FC-03-B06-AG-12", "Lagos", 9.1, 7.1), "REGION_POSTCODE_MISMATCH")
+        self.assertEqual(detect_geo_anomaly("FC-03-B06-AG-12", "Lagos", 6.5244, 3.3792), None)
+        self.assertEqual(detect_geo_anomaly("NG-01-ABC-99", "Kaduna", 10.5, 7.4), None)
+        self.assertEqual(detect_geo_anomaly("NG-01-ABC-99", "Kaduna", 91.0, 7.4), "GEO_FENCE_MISMATCH")
+
+    def test_env_bool_accepts_only_documented_values(self):
+        for value in ("true", "1", "yes", "on", " TRUE "):
+            with self.subTest(value=value), patch.dict(os.environ, {"TEST_BOOL": value}):
+                self.assertTrue(_env_bool("TEST_BOOL", False))
+        for value in ("false", "0", "no", "off", " FALSE "):
+            with self.subTest(value=value), patch.dict(os.environ, {"TEST_BOOL": value}):
+                self.assertFalse(_env_bool("TEST_BOOL", True))
+        with patch.dict(os.environ, {"TEST_BOOL": "perhaps"}):
+            with self.assertRaisesRegex(ValueError, "TEST_BOOL must be one of"):
+                _env_bool("TEST_BOOL", False)
 
     def test_proxy_to_nipost_handles_failed_connect(self):
         async def run():
@@ -141,9 +154,16 @@ class SecurityCoreTests(unittest.TestCase):
         with patch.object(security, "settings", security.settings.__class__(mock_nipost=False, nipost_api_key="abc", nipost_base_url="https://api.postcode.gov.ng")):
             error_result = asyncio.run(run_test(httpx.Response(502, text="sensitive upstream response")))
             malformed_result = asyncio.run(run_test(httpx.Response(200, text="not JSON")))
+            object_result = asyncio.run(run_test(httpx.Response(200, json={"provider-defined": "value"})))
+            non_object_result = asyncio.run(run_test(httpx.Response(200, json=["not", "an object"])))
+            redirect_result = asyncio.run(run_test(httpx.Response(302, json={"unverified": True})))
 
         self.assertEqual(error_result["status"], "UPSTREAM_ERROR")
         self.assertEqual(malformed_result["status"], "UPSTREAM_ERROR")
+        self.assertEqual(object_result["status"], "SUCCESS")
+        self.assertEqual(object_result["nipost_data"], {"provider-defined": "value"})
+        self.assertEqual(non_object_result["status"], "UPSTREAM_ERROR")
+        self.assertEqual(redirect_result["status"], "UPSTREAM_ERROR")
 
 
 @unittest.skipUnless(

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -18,6 +19,7 @@ from security import (
     normalize_region,
     proxy_to_nipost,
     register_nonce,
+    redis_client,
     validate_client_policy,
     validate_nonce_format,
     verify_hmac_signature,
@@ -160,8 +162,7 @@ async def health_check():
     ready = True
     redis_status = "unknown"
     try:
-        from security import redis_client
-        redis_status = "ok" if redis_client.ping() else "unavailable"
+        redis_status = "ok" if await asyncio.to_thread(redis_client.ping) else "unavailable"
         ready = ready and redis_status == "ok"
     except Exception:
         redis_status = "unavailable"
@@ -229,10 +230,6 @@ async def secure_postcode_query(
         emit_event("WARNING", "CLIENT_POLICY_VIOLATION", request_id=request_id, client_id=x_client_id, region=normalize_region(query.declared_region), lookup_level=query.level)
         raise
 
-    if not register_nonce(x_client_id, x_nonce):
-        emit_event("WARNING", "REPLAY_DETECTED", request_id=request_id, client_id=x_client_id, ip=client_ip)
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Replay detected. Nonce already used.")
-
     try:
         allowed = check_rate_limit(x_client_id)
     except HTTPException:
@@ -242,6 +239,10 @@ async def secure_postcode_query(
     if not allowed:
         emit_event("WARNING", "RATE_LIMIT_EXCEEDED", request_id=request_id, client_id=x_client_id, ip=client_ip)
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded.")
+
+    if not register_nonce(x_client_id, x_nonce):
+        emit_event("WARNING", "REPLAY_DETECTED", request_id=request_id, client_id=x_client_id, ip=client_ip)
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Replay detected. Nonce already used.")
 
     geo_issue = detect_geo_anomaly(query.postcode, query.declared_region, query.client_lat, query.client_lon)
     if geo_issue:

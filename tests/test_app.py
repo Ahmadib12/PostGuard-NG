@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 import unittest
 import uuid
@@ -90,11 +91,24 @@ class SecureQueryAPITests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post("/api/v1/secure-query", content=body, headers=headers)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
-    @patch("app.register_nonce", return_value=False)
-    async def test_reused_nonce_is_rejected(self, _register_nonce):
+    async def test_reused_nonce_is_rejected_after_rate_limit_check(self):
+        checks = []
+
+        def check_rate_limit(_client_id):
+            checks.append("rate_limit")
+            return True
+
+        def register_nonce(_client_id, _nonce):
+            checks.append("nonce")
+            return False
+
         body, headers = self.signed_request()
-        response = await self.client.post("/api/v1/secure-query", content=body, headers=headers)
+        with patch("app.check_rate_limit", side_effect=check_rate_limit), patch(
+            "app.register_nonce", side_effect=register_nonce
+        ):
+            response = await self.client.post("/api/v1/secure-query", content=body, headers=headers)
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(checks, ["rate_limit", "nonce"])
 
     async def test_malformed_nonce_is_rejected(self):
         body, headers = self.signed_request(nonce="bad!nonce")
@@ -104,9 +118,10 @@ class SecureQueryAPITests(unittest.IsolatedAsyncioTestCase):
     @patch("app.check_rate_limit", return_value=False)
     async def test_rate_limit_is_enforced(self, _rate_limit):
         body, headers = self.signed_request()
-        with patch("app.register_nonce", return_value=True):
+        with patch("app.register_nonce") as register_nonce:
             response = await self.client.post("/api/v1/secure-query", content=body, headers=headers)
         self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        register_nonce.assert_not_called()
 
     async def test_invalid_region_is_rejected(self):
         body, headers = self.signed_request(payload={
@@ -166,12 +181,21 @@ class SecureQueryAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
 
     async def test_health_and_readiness_report_dependency_status(self):
-        response = await self.client.get("/health")
+        ping_threads = []
+
+        def ping():
+            ping_threads.append(threading.get_ident())
+            return True
+
+        with patch("security.redis_client.ping", side_effect=ping):
+            response = await self.client.get("/health")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         body = response.json()
         self.assertIn("readiness", body)
         self.assertIn("upstream", body)
         self.assertIn("status", body)
+        self.assertTrue(body["readiness"]["ready"])
+        self.assertNotEqual(ping_threads[0], threading.get_ident())
 
 
 if __name__ == "__main__":

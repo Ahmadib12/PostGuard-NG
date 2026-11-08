@@ -37,10 +37,10 @@ The gateway checks:
 1. Client identity exists in the configured policy map.
 2. Request header format is valid.
 3. Timestamp is within the configured skew window.
-4. Nonce format is valid and not previously used for that client.
-5. HMAC is computed over the exact raw body using the client-specific secret.
-6. Client policy allows the region and lookup level.
-7. Redis-backed rate limit permits the request.
+4. HMAC is computed over the exact raw body using the client-specific secret.
+5. Client policy allows the region and lookup level.
+6. Redis-backed rate limit permits the request.
+7. The nonce is atomically registered for that client; duplicates are rejected.
 
 Canonical signing format:
 
@@ -52,7 +52,7 @@ The signature is generated with HMAC-SHA256 using a client-specific secret. Secr
 
 ## Replay protection and rate limiting
 
-Replay protection is Redis-backed and uses an atomic `SET ... NX` operation with a TTL for each nonce. If Redis is unavailable, the application fails closed and returns a 503-style service unavailable response instead of bypassing the check.
+Replay protection is Redis-backed and uses an atomic `SET ... NX` operation with a TTL for each nonce. The rate limit is checked first, so a request rejected with `429` does not create a nonce entry; it can be retried with the same signed request after the rate window only while its timestamp remains within the configured clock-skew limit. Requests that pass the limit still register their nonce atomically, so concurrent duplicates cannot both be accepted. If Redis is unavailable, the application fails closed and returns a 503-style service unavailable response instead of bypassing either check.
 
 Rate limiting also uses Redis atomic counters. Each client keeps a separate counter and window. A Redis failure prevents request acceptance and emits a structured error event.
 
@@ -72,13 +72,13 @@ This is intentionally structured so a database-backed client registry can be int
 
 ## Geo anomaly monitoring
 
-Geo checks are advisory only. Client-supplied coordinates are untrusted and cannot prove the user’s real location. The gateway logs mismatch warnings such as `GEO_FENCE_MISMATCH` or `REGION_POSTCODE_MISMATCH`, but it does not block a valid request solely because the provided latitude/longitude appears inconsistent.
+Geo monitoring is advisory and does not infer a location from postcode prefixes or assume Abuja coordinates represent Nigerian coverage. The prototype has no authoritative postcode-to-region or coordinate dataset, and client-supplied coordinates cannot prove a user’s real location. The request model only validates that coordinates are within global latitude/longitude bounds; reliable geographic anomaly monitoring requires trusted location signals and authoritative postal data.
 
 A trusted location source and authoritative postcode-region data would be required before making geo-based enforcement decisions.
 
 ## Upstream proxy protection
 
-The proxy layer uses explicit timeouts, disables redirects, validates upstream response shape, and does not expose upstream error bodies or raw exceptions to clients.
+The proxy layer uses explicit timeouts, disables redirects, accepts only 2xx responses with valid JSON whose top-level value is an object, and does not expose upstream error bodies or raw exceptions to clients. Because no authoritative NIPOST response schema is available here, it does not assume any specific fields within that object.
 
 Important: the current implementation is mock-first. The app supports mock mode even when a live upstream is not configured. Do not treat this as a verified live NIPOST integration unless the official endpoint and credentials are provided and tested.
 
@@ -161,7 +161,7 @@ export POSTGUARD_DEMO_CLIENT_SECRET="replace-with-32-plus-bytes"
 GET /health
 ```
 
-Returns liveness, readiness, and upstream mode information without exposing secrets or infrastructure details.
+Returns liveness, readiness, and upstream mode information without exposing secrets or infrastructure details. The synchronous Redis readiness ping is run in a worker thread so it does not block the asynchronous event loop.
 
 ### Secure postcode lookup
 

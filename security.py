@@ -134,16 +134,6 @@ def validate_client_policy(client_id: str, declared_region: str, requested_level
 def detect_geo_anomaly(postcode: str, declared_region: str, client_lat: float, client_lon: float) -> Optional[str]:
     if not (-90.0 <= float(client_lat) <= 90.0) or not (-180.0 <= float(client_lon) <= 180.0):
         return "GEO_FENCE_MISMATCH"
-
-    postcode = postcode.upper().strip()
-    region = normalize_region(declared_region)
-
-    if postcode.startswith("FC") or postcode.startswith("FCT"):
-        if region not in {"abuja", "fct", "abuja federal capital territory"}:
-            return "REGION_POSTCODE_MISMATCH"
-        if not (8.9 <= client_lat <= 9.3 and 6.9 <= client_lon <= 7.7):
-            return "GEO_FENCE_MISMATCH"
-
     return None
 
 
@@ -180,7 +170,7 @@ async def proxy_to_nipost(postcode: str, level: int, client: httpx.AsyncClient) 
             "status_code": 502,
         }
 
-    if response.status_code >= 400:
+    if not 200 <= response.status_code < 300:
         logger.warning(json.dumps({"event": "UPSTREAM_FAILURE", "status_code": response.status_code, "target": url}))
         return {
             "status": "UPSTREAM_ERROR",
