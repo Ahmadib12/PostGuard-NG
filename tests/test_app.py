@@ -55,26 +55,31 @@ class SecureQueryAPITests(unittest.IsolatedAsyncioTestCase):
         }
         return body, headers
 
-    @patch("app.register_nonce", return_value=True)
-    @patch("app.check_rate_limit", return_value=True)
-    async def test_valid_signed_request_succeeds(self, _rate_limit, _register_nonce):
+    @patch("app.check_rate_limit_and_register_nonce", return_value="allowed")
+    async def test_valid_signed_request_succeeds(self, request_controls):
+        event_loop_thread = threading.get_ident()
+        worker_threads = []
+
+        def allow_request(*_args):
+            worker_threads.append(threading.get_ident())
+            return "allowed"
+
+        request_controls.side_effect = allow_request
         body, headers = self.signed_request()
         response = await self.client.post("/api/v1/secure-query", content=body, headers=headers)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.json()["nipost_data"]["source"], "mock")
         self.assertNotIn("security_score", response.json())
-        _register_nonce.assert_called_once()
-        _rate_limit.assert_called_once()
+        request_controls.assert_called_once_with("demo-client", headers["X-Nonce"])
+        self.assertNotEqual(worker_threads[0], event_loop_thread)
 
-    @patch("app.register_nonce")
-    @patch("app.check_rate_limit")
-    async def test_invalid_signature_does_not_consume_redis_controls(self, rate_limit, register_nonce):
+    @patch("app.check_rate_limit_and_register_nonce")
+    async def test_invalid_signature_does_not_consume_redis_controls(self, request_controls):
         body, headers = self.signed_request()
         headers["X-Signature"] = "0" * 64
         response = await self.client.post("/api/v1/secure-query", content=body, headers=headers)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-        register_nonce.assert_not_called()
-        rate_limit.assert_not_called()
+        request_controls.assert_not_called()
 
     async def test_expired_timestamp_is_rejected(self):
         body, headers = self.signed_request(timestamp=str(int(time.time()) - settings.max_clock_skew_seconds - 5))
@@ -91,37 +96,24 @@ class SecureQueryAPITests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post("/api/v1/secure-query", content=body, headers=headers)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
-    async def test_reused_nonce_is_rejected_after_rate_limit_check(self):
-        checks = []
-
-        def check_rate_limit(_client_id):
-            checks.append("rate_limit")
-            return True
-
-        def register_nonce(_client_id, _nonce):
-            checks.append("nonce")
-            return False
-
+    @patch("app.check_rate_limit_and_register_nonce", return_value="replay")
+    async def test_reused_nonce_is_rejected(self, request_controls):
         body, headers = self.signed_request()
-        with patch("app.check_rate_limit", side_effect=check_rate_limit), patch(
-            "app.register_nonce", side_effect=register_nonce
-        ):
-            response = await self.client.post("/api/v1/secure-query", content=body, headers=headers)
+        response = await self.client.post("/api/v1/secure-query", content=body, headers=headers)
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
-        self.assertEqual(checks, ["rate_limit", "nonce"])
+        request_controls.assert_called_once_with("demo-client", headers["X-Nonce"])
 
     async def test_malformed_nonce_is_rejected(self):
         body, headers = self.signed_request(nonce="bad!nonce")
         response = await self.client.post("/api/v1/secure-query", content=body, headers=headers)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    @patch("app.check_rate_limit", return_value=False)
-    async def test_rate_limit_is_enforced(self, _rate_limit):
+    @patch("app.check_rate_limit_and_register_nonce", return_value="rate_limited")
+    async def test_rate_limit_is_enforced(self, request_controls):
         body, headers = self.signed_request()
-        with patch("app.register_nonce") as register_nonce:
-            response = await self.client.post("/api/v1/secure-query", content=body, headers=headers)
+        response = await self.client.post("/api/v1/secure-query", content=body, headers=headers)
         self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
-        register_nonce.assert_not_called()
+        request_controls.assert_called_once_with("demo-client", headers["X-Nonce"])
 
     async def test_invalid_region_is_rejected(self):
         body, headers = self.signed_request(payload={

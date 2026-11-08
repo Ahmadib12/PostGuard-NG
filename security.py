@@ -26,6 +26,21 @@ end
 return count
 """
 
+_REQUEST_CONTROLS_SCRIPT = """
+local count = redis.call("INCR", KEYS[1])
+if count == 1 then
+    redis.call("EXPIRE", KEYS[1], ARGV[1])
+end
+if count > tonumber(ARGV[2]) then
+    return 0
+end
+local nonce_registered = redis.call("SET", KEYS[2], "1", "EX", ARGV[3], "NX")
+if not nonce_registered then
+    return -1
+end
+return 1
+"""
+
 
 def current_unix_time() -> int:
     return int(time.time())
@@ -74,6 +89,31 @@ def check_rate_limit(client_id: str) -> bool:
             detail="Request security service is temporarily unavailable.",
         ) from exc
     return current_count <= limit
+
+
+def check_rate_limit_and_register_nonce(client_id: str, nonce: str) -> str:
+    limit = settings.client_policy.get(client_id, {}).get("rate_limit_per_minute", settings.rate_limit_per_minute)
+    rate_key = f"postguard:rate:{client_id}"
+    nonce_key = f"postguard:nonce:{client_id}:{nonce}"
+
+    try:
+        result = redis_client.eval(
+            _REQUEST_CONTROLS_SCRIPT,
+            2,
+            rate_key,
+            nonce_key,
+            settings.rate_limit_window_seconds,
+            limit,
+            settings.nonce_ttl_seconds,
+        )
+    except redis.RedisError as exc:
+        logger.error(json.dumps({"event": "REDIS_FAILURE", "component": "request_controls"}))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Request security service is temporarily unavailable.",
+        ) from exc
+
+    return {1: "allowed", 0: "rate_limited", -1: "replay"}.get(result, "unavailable")
 
 
 def verify_hmac_signature(

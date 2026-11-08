@@ -52,7 +52,7 @@ The signature is generated with HMAC-SHA256 using a client-specific secret. Secr
 
 ## Replay protection and rate limiting
 
-Replay protection is Redis-backed and uses an atomic `SET ... NX` operation with a TTL for each nonce. The rate limit is checked first, so a request rejected with `429` does not create a nonce entry; it can be retried with the same signed request after the rate window only while its timestamp remains within the configured clock-skew limit. Requests that pass the limit still register their nonce atomically, so concurrent duplicates cannot both be accepted. If Redis is unavailable, the application fails closed and returns a 503-style service unavailable response instead of bypassing either check.
+The asynchronous request path executes synchronous Redis work in a worker thread and uses one atomic Lua script to increment/check the client rate counter and register the nonce. A request over the limit returns `429` without consuming its nonce; an in-limit duplicate returns `409`. Concurrent requests cannot bypass either check because Redis executes the combined script atomically. A rate-limited request can be retried with the same signed request after the rate window only while its timestamp remains within the configured clock-skew limit. If Redis is unavailable, the application fails closed with a 503 response.
 
 Rate limiting also uses Redis atomic counters. Each client keeps a separate counter and window. A Redis failure prevents request acceptance and emits a structured error event.
 

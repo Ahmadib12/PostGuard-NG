@@ -13,12 +13,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from config import settings
 from security import (
-    check_rate_limit,
+    check_rate_limit_and_register_nonce,
     detect_geo_anomaly,
     is_allowed_client,
     normalize_region,
     proxy_to_nipost,
-    register_nonce,
     redis_client,
     validate_client_policy,
     validate_nonce_format,
@@ -231,18 +230,29 @@ async def secure_postcode_query(
         raise
 
     try:
-        allowed = check_rate_limit(x_client_id)
+        request_control_result = await asyncio.to_thread(
+            check_rate_limit_and_register_nonce,
+            x_client_id,
+            x_nonce,
+        )
     except HTTPException:
-        emit_event("ERROR", "RATE_LIMIT_CHECK_FAILED", request_id=request_id, client_id=x_client_id)
+        emit_event("ERROR", "REQUEST_CONTROLS_FAILED", request_id=request_id, client_id=x_client_id)
         raise
 
-    if not allowed:
+    if request_control_result == "rate_limited":
         emit_event("WARNING", "RATE_LIMIT_EXCEEDED", request_id=request_id, client_id=x_client_id, ip=client_ip)
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded.")
 
-    if not register_nonce(x_client_id, x_nonce):
+    if request_control_result == "replay":
         emit_event("WARNING", "REPLAY_DETECTED", request_id=request_id, client_id=x_client_id, ip=client_ip)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Replay detected. Nonce already used.")
+
+    if request_control_result != "allowed":
+        emit_event("ERROR", "REQUEST_CONTROLS_FAILED", request_id=request_id, client_id=x_client_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Request security service is temporarily unavailable.",
+        )
 
     geo_issue = detect_geo_anomaly(query.postcode, query.declared_region, query.client_lat, query.client_lon)
     if geo_issue:

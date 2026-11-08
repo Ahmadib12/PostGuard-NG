@@ -19,7 +19,9 @@ import security
 from config import _env_bool, settings
 from security import (
     _RATE_LIMIT_SCRIPT,
+    _REQUEST_CONTROLS_SCRIPT,
     check_rate_limit,
+    check_rate_limit_and_register_nonce,
     detect_geo_anomaly,
     proxy_to_nipost,
     register_nonce,
@@ -90,6 +92,30 @@ class SecurityCoreTests(unittest.TestCase):
     def test_rate_limit_fails_closed_when_redis_is_unavailable(self, _eval_script):
         with self.assertRaises(HTTPException) as raised:
             check_rate_limit("demo-client")
+        self.assertEqual(raised.exception.status_code, 503)
+
+    @patch("security.redis_client.eval", return_value=1)
+    def test_request_controls_are_atomic_in_one_script(self, eval_script):
+        self.assertEqual(check_rate_limit_and_register_nonce("demo-client", "unique-nonce"), "allowed")
+        eval_script.assert_called_once_with(
+            _REQUEST_CONTROLS_SCRIPT,
+            2,
+            "postguard:rate:demo-client",
+            "postguard:nonce:demo-client:unique-nonce",
+            settings.rate_limit_window_seconds,
+            settings.client_policy["demo-client"]["rate_limit_per_minute"],
+            settings.nonce_ttl_seconds,
+        )
+
+    @patch("security.redis_client.eval", side_effect=[0, -1])
+    def test_request_controls_distinguish_rate_limit_and_replay(self, _eval_script):
+        self.assertEqual(check_rate_limit_and_register_nonce("demo-client", "nonce-a"), "rate_limited")
+        self.assertEqual(check_rate_limit_and_register_nonce("demo-client", "nonce-b"), "replay")
+
+    @patch("security.redis_client.eval", side_effect=redis.RedisError("unavailable"))
+    def test_request_controls_fail_closed_when_redis_is_unavailable(self, _eval_script):
+        with self.assertRaises(HTTPException) as raised:
+            check_rate_limit_and_register_nonce("demo-client", "unique-nonce")
         self.assertEqual(raised.exception.status_code, 503)
 
     @patch("security.redis_client.set", return_value=None)
@@ -171,7 +197,7 @@ class SecurityCoreTests(unittest.TestCase):
     "Set RUN_REDIS_INTEGRATION_TESTS=1 to run against the configured Redis instance.",
 )
 class RedisConcurrencyIntegrationTests(unittest.TestCase):
-    def test_nonce_and_rate_limit_are_atomic_under_concurrency(self):
+    def test_request_controls_are_atomic_under_concurrency(self):
         try:
             redis_client.ping()
         except redis.RedisError as exc:
@@ -179,15 +205,24 @@ class RedisConcurrencyIntegrationTests(unittest.TestCase):
 
         unique_id = f"integration-{os.getpid()}-{time.time_ns()}"
         nonce_key = f"postguard:nonce:{unique_id}:same-nonce-value"
+        limited_nonce_key = f"postguard:nonce:{unique_id}:limited-nonce-value"
         rate_key = f"postguard:rate:{unique_id}"
         try:
             with ThreadPoolExecutor(max_workers=32) as pool:
-                nonce_results = list(pool.map(lambda _: register_nonce(unique_id, "same-nonce-value"), range(32)))
-                rate_results = list(pool.map(lambda _: check_rate_limit(unique_id), range(32)))
-            self.assertEqual(sum(nonce_results), 1)
-            self.assertEqual(sum(rate_results), settings.rate_limit_per_minute)
+                results = list(pool.map(
+                    lambda _: check_rate_limit_and_register_nonce(unique_id, "same-nonce-value"),
+                    range(32),
+                ))
+            self.assertEqual(results.count("allowed"), 1)
+            self.assertEqual(results.count("replay"), settings.rate_limit_per_minute - 1)
+            self.assertEqual(results.count("rate_limited"), 32 - settings.rate_limit_per_minute)
+            self.assertEqual(
+                check_rate_limit_and_register_nonce(unique_id, "limited-nonce-value"),
+                "rate_limited",
+            )
+            self.assertFalse(redis_client.exists(limited_nonce_key))
         finally:
-            redis_client.delete(nonce_key, rate_key)
+            redis_client.delete(nonce_key, limited_nonce_key, rate_key)
 
 
 if __name__ == "__main__":
