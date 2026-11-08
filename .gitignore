@@ -2,3 +2,9 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+node_modules/
+dashboard/dist/
+postguard_dashboard.db
+postguard_dashboard.db-*
+*.tsbuildinfo
+dump.rdb

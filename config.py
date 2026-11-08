@@ -40,6 +40,15 @@ class Settings:
     mock_nipost: bool = _env_bool("MOCK_NIPOST", False)
     nipost_base_url: str = os.getenv("NIPOST_BASE_URL", "https://api.postcode.gov.ng").rstrip("/")
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0").strip()
+    dashboard_database_url: str = os.getenv("DASHBOARD_DATABASE_URL", "sqlite:///./postguard_dashboard.db").strip()
+
+    # Administrator authentication is separate from client HMAC credentials.
+    admin_username: str = os.getenv("ADMIN_USERNAME", "").strip()
+    admin_password: str = os.getenv("ADMIN_PASSWORD", "")
+    admin_session_ttl_seconds: int = _env_positive_int("ADMIN_SESSION_TTL_SECONDS", 3600)
+    admin_cookie_secure: bool = _env_bool("ADMIN_COOKIE_SECURE", True)
+    admin_login_attempts: int = _env_positive_int("ADMIN_LOGIN_ATTEMPTS", 5)
+    admin_login_window_seconds: int = _env_positive_int("ADMIN_LOGIN_WINDOW_SECONDS", 900)
 
     # Security parameters
     max_clock_skew_seconds: int = _env_positive_int("MAX_CLOCK_SKEW_SECONDS", 120)
@@ -90,6 +99,11 @@ class Settings:
         missing = self.required
         if missing:
             raise RuntimeError("Missing or invalid required configuration: " + "; ".join(missing))
+
+        if bool(self.admin_username) != bool(self.admin_password):
+            raise RuntimeError("ADMIN_USERNAME and ADMIN_PASSWORD must be configured together.")
+        if self.admin_password and len(self.admin_password) < 16:
+            raise RuntimeError("ADMIN_PASSWORD must contain at least 16 characters.")
 
         for client_id, policy in self.client_policy.items():
             regions = policy.get("allowed_regions", [])

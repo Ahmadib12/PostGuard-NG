@@ -11,7 +11,9 @@ from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from admin_api import router as admin_router
 from config import settings
+from dashboard_store import initialize_admin_credentials, initialize_database, record_request, record_security_event
 from security import (
     check_rate_limit_and_register_nonce,
     detect_geo_anomaly,
@@ -28,7 +30,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("PostGuard-NG")
 
 
-def emit_event(level: str, event: str, request_id: str | None = None, **fields):
+async def emit_event(
+    level: str,
+    event: str,
+    request_id: str | None = None,
+    http_status: int | None = None,
+    **fields,
+):
     payload = {"timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "level": level, "event": event}
     if request_id:
         payload["request_id"] = request_id
@@ -37,10 +45,32 @@ def emit_event(level: str, event: str, request_id: str | None = None, **fields):
             continue
         payload[key] = value
     logger.log({"INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}.get(level.upper(), 20), json.dumps(payload, separators=(",", ":"), ensure_ascii=True))
+    try:
+        event_fields = dict(fields)
+        client_id = event_fields.pop("client_id", None)
+        await asyncio.to_thread(
+            record_security_event,
+            event,
+            request_id,
+            client_id,
+            http_status,
+            **event_fields,
+        )
+    except Exception:
+        logger.exception("Could not persist security telemetry; request security enforcement remains active.")
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
+    await asyncio.to_thread(initialize_database)
+    generated_admin = await asyncio.to_thread(initialize_admin_credentials)
+    if generated_admin:
+        logger.warning(
+            "Initial administrator credentials (shown once): username=%s password=%s. "
+            "Set ADMIN_USERNAME and ADMIN_PASSWORD in the local environment to replace them.",
+            generated_admin[0],
+            generated_admin[1],
+        )
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(10.0, connect=3.0),
         follow_redirects=False,
@@ -55,6 +85,7 @@ app = FastAPI(
     version=settings.app_version,
     lifespan=lifespan,
 )
+app.include_router(admin_router)
 
 
 _CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -118,7 +149,49 @@ class RequestBodyLimitMiddleware:
         await self.application(scope, replay_receive, send)
 
 
+class RequestTelemetryMiddleware:
+    def __init__(self, app):
+        self.application = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not scope.get("path", "").startswith("/api/v1/"):
+            await self.application(scope, receive, send)
+            return
+
+        request_id = uuid.uuid4().hex
+        state = scope.setdefault("state", {})
+        state["request_id"] = request_id
+        started = asyncio.get_running_loop().time()
+        status_code = 500
+
+        async def capture_status(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            await send(message)
+
+        try:
+            await self.application(scope, receive, capture_status)
+        finally:
+            headers = dict(scope.get("headers", []))
+            raw_client_id = headers.get(b"x-client-id", b"").decode("ascii", "ignore")
+            client_id = raw_client_id if _CLIENT_ID_PATTERN.fullmatch(raw_client_id) else None
+            duration_ms = max(0, int((asyncio.get_running_loop().time() - started) * 1000))
+            try:
+                await asyncio.to_thread(
+                    record_request,
+                    request_id,
+                    client_id,
+                    status_code,
+                    duration_ms,
+                    bool(state.get("authenticated", False)),
+                )
+            except Exception:
+                logger.exception("Could not persist request telemetry; request security enforcement remains active.")
+
+
 app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=settings.max_request_body_bytes)
+app.add_middleware(RequestTelemetryMiddleware)
 
 
 class PostcodeQuery(BaseModel):
@@ -193,21 +266,20 @@ async def secure_postcode_query(
     x_nonce: str = Header(..., alias="X-Nonce"),
     x_signature: str = Header(..., alias="X-Signature"),
 ):
-    request_id = uuid.uuid4().hex
-    client_ip = request.client.host if request.client else "unknown"
+    request_id = request.state.request_id
 
     if not re.fullmatch(r"^[A-Za-z0-9._-]+$", x_client_id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed client ID.")
     if not x_timestamp or not x_timestamp.isascii() or not x_timestamp.isdigit() or len(x_timestamp) > 12:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed timestamp.")
     if not validate_nonce_format(x_nonce):
-        emit_event("WARNING", "INVALID_NONCE", request_id=request_id, client_id=x_client_id, ip=client_ip)
+        await emit_event("WARNING", "INVALID_NONCE", request_id=request_id, http_status=400, client_id=x_client_id)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed nonce value.")
     if not re.fullmatch(r"^[0-9a-fA-F]{64}$", x_signature):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed signature.")
 
     if not is_allowed_client(x_client_id):
-        emit_event("WARNING", "UNKNOWN_CLIENT", request_id=request_id, client_id=x_client_id, ip=client_ip)
+        await emit_event("WARNING", "UNKNOWN_CLIENT", request_id=request_id, http_status=401, client_id=x_client_id)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unknown client ID.")
 
     raw_body = await request.body()
@@ -220,13 +292,22 @@ async def secure_postcode_query(
         request.method,
         request.url.path,
     ):
-        emit_event("CRITICAL", "INVALID_SIGNATURE", request_id=request_id, client_id=x_client_id, ip=client_ip, path=request.url.path)
+        await emit_event("CRITICAL", "INVALID_SIGNATURE", request_id=request_id, http_status=403, client_id=x_client_id, path=request.url.path)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid HMAC signature.")
 
+    request.state.authenticated = True
     try:
         validate_client_policy(x_client_id, query.declared_region, query.level)
     except HTTPException:
-        emit_event("WARNING", "CLIENT_POLICY_VIOLATION", request_id=request_id, client_id=x_client_id, region=normalize_region(query.declared_region), lookup_level=query.level)
+        await emit_event(
+            "WARNING",
+            "CLIENT_POLICY_VIOLATION",
+            request_id=request_id,
+            http_status=403,
+            client_id=x_client_id,
+            region=normalize_region(query.declared_region),
+            lookup_level=query.level,
+        )
         raise
 
     try:
@@ -236,19 +317,19 @@ async def secure_postcode_query(
             x_nonce,
         )
     except HTTPException:
-        emit_event("ERROR", "REQUEST_CONTROLS_FAILED", request_id=request_id, client_id=x_client_id)
+        await emit_event("ERROR", "REDIS_FAILURE", request_id=request_id, http_status=503, client_id=x_client_id, component="request_controls")
         raise
 
     if request_control_result == "rate_limited":
-        emit_event("WARNING", "RATE_LIMIT_EXCEEDED", request_id=request_id, client_id=x_client_id, ip=client_ip)
+        await emit_event("WARNING", "RATE_LIMIT_EXCEEDED", request_id=request_id, http_status=429, client_id=x_client_id)
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded.")
 
     if request_control_result == "replay":
-        emit_event("WARNING", "REPLAY_DETECTED", request_id=request_id, client_id=x_client_id, ip=client_ip)
+        await emit_event("WARNING", "REPLAY_DETECTED", request_id=request_id, http_status=409, client_id=x_client_id)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Replay detected. Nonce already used.")
 
     if request_control_result != "allowed":
-        emit_event("ERROR", "REQUEST_CONTROLS_FAILED", request_id=request_id, client_id=x_client_id)
+        await emit_event("ERROR", "REDIS_FAILURE", request_id=request_id, http_status=503, client_id=x_client_id, component="request_controls")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Request security service is temporarily unavailable.",
@@ -256,11 +337,24 @@ async def secure_postcode_query(
 
     geo_issue = detect_geo_anomaly(query.postcode, query.declared_region, query.client_lat, query.client_lon)
     if geo_issue:
-        emit_event("WARNING", geo_issue, request_id=request_id, client_id=x_client_id, postcode=query.postcode, region=normalize_region(query.declared_region), ip=client_ip)
+        await emit_event(
+            "WARNING",
+            geo_issue,
+            request_id=request_id,
+            client_id=x_client_id,
+            region=normalize_region(query.declared_region),
+        )
 
     upstream_result = await proxy_to_nipost(query.postcode, query.level, request.app.state.http_client)
     if upstream_result["status"] == "UPSTREAM_ERROR":
-        emit_event("ERROR", "UPSTREAM_FAILURE", request_id=request_id, client_id=x_client_id, postcode=query.postcode, upstream_status=upstream_result.get("status_code"))
+        await emit_event(
+            "ERROR",
+            "UPSTREAM_FAILURE",
+            request_id=request_id,
+            http_status=502,
+            client_id=x_client_id,
+            upstream_status=upstream_result.get("status_code"),
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={
@@ -268,8 +362,6 @@ async def secure_postcode_query(
                 "upstream_status_code": upstream_result.get("status_code"),
             },
         )
-
-    emit_event("INFO", "REQUEST_ACCEPTED", request_id=request_id, client_id=x_client_id, postcode=query.postcode, upstream_source=upstream_result.get("source", "mock"))
 
     return {
         "status": "SUCCESS",
