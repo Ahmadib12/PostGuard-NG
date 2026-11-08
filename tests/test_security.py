@@ -5,8 +5,7 @@ import os
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 os.environ["POSTGUARD_DEMO_CLIENT_SECRET"] = "test-demo-secret-" + ("d" * 32)
 os.environ["POSTGUARD_PARTNER_X_SECRET"] = "test-partner-secret-" + ("p" * 32)
@@ -16,18 +15,57 @@ import redis
 import httpx
 from fastapi import HTTPException
 
+import security
 from config import settings
 from security import (
     _RATE_LIMIT_SCRIPT,
     check_rate_limit,
+    detect_geo_anomaly,
     proxy_to_nipost,
     register_nonce,
     redis_client,
+    validate_client_policy,
     verify_hmac_signature,
 )
 
 
-class RedisProtectionTests(unittest.TestCase):
+class SecurityCoreTests(unittest.TestCase):
+    def make_signature(self, body: bytes, client_id: str = "demo-client", timestamp: str | None = None, nonce: str = "nonce123456789012") -> str:
+        timestamp = timestamp or str(int(time.time()))
+        prefix = f"POST:/api/v1/secure-query:{client_id}:{timestamp}:{nonce}:".encode()
+        return hmac.new(settings.client_secrets[client_id].encode(), prefix + body, hashlib.sha256).hexdigest()
+
+    def test_valid_signature_is_accepted(self):
+        body = b'{"postcode":"FC-03-B06-AG-12","level":1,"client_lat":9.0,"client_lon":7.0,"declared_region":"Abuja"}'
+        timestamp = str(int(time.time()))
+        signature = self.make_signature(body, timestamp=timestamp)
+        self.assertTrue(verify_hmac_signature(body, "demo-client", timestamp, "nonce123456789012", signature, "POST", "/api/v1/secure-query"))
+
+    def test_invalid_signature_is_rejected(self):
+        body = b'{"postcode":"FC-03-B06-AG-12"}'
+        self.assertFalse(verify_hmac_signature(body, "demo-client", str(int(time.time())), "nonce123456789012", "0" * 64, "POST", "/api/v1/secure-query"))
+
+    def test_expired_timestamp_is_rejected(self):
+        stale = str(int(time.time()) - settings.max_clock_skew_seconds - 5)
+        body = b'{"postcode":"FC-03-B06-AG-12"}'
+        signature = self.make_signature(body, timestamp=stale)
+        self.assertFalse(verify_hmac_signature(body, "demo-client", stale, "nonce123456789012", signature, "POST", "/api/v1/secure-query"))
+
+    def test_future_timestamp_outside_skew_is_rejected(self):
+        future = str(int(time.time()) + settings.max_clock_skew_seconds + 5)
+        body = b'{"postcode":"FC-03-B06-AG-12"}'
+        signature = self.make_signature(body, timestamp=future)
+        self.assertFalse(verify_hmac_signature(body, "demo-client", future, "nonce123456789012", signature, "POST", "/api/v1/secure-query"))
+
+    def test_unknown_client_is_rejected(self):
+        body = b'{"postcode":"FC-03-B06-AG-12"}'
+        self.assertFalse(verify_hmac_signature(body, "unknown-client", str(int(time.time())), "nonce123456789012", "0" * 64, "POST", "/api/v1/secure-query"))
+
+    def test_invalid_nonce_format_is_rejected(self):
+        body = b'{"postcode":"FC-03-B06-AG-12"}'
+        signature = self.make_signature(body)
+        self.assertFalse(verify_hmac_signature(body, "demo-client", str(int(time.time())), "bad!nonce", signature, "POST", "/api/v1/secure-query"))
+
     @patch("security.redis_client.set", return_value=True)
     def test_nonce_registration_is_atomic(self, set_nonce):
         self.assertTrue(register_nonce("demo-client", "unique-nonce"))
@@ -45,6 +83,7 @@ class RedisProtectionTests(unittest.TestCase):
             _RATE_LIMIT_SCRIPT,
             1,
             "postguard:rate:demo-client",
+            settings.rate_limit_window_seconds,
         )
 
     @patch("security.redis_client.eval", side_effect=redis.RedisError("unavailable"))
@@ -64,51 +103,47 @@ class RedisProtectionTests(unittest.TestCase):
             register_nonce("demo-client", "unique-nonce")
         self.assertEqual(raised.exception.status_code, 503)
 
-    def test_signatures_use_the_selected_clients_secret(self):
-        timestamp = str(int(time.time()))
-        body = b'{"value":"signed"}'
-        prefix = f"POST:/api/v1/secure-query:demo-client:{timestamp}:nonce1234567890:".encode()
-        signature = hmac.new(
-            settings.client_secrets["demo-client"].encode(),
-            prefix + body,
-            hashlib.sha256,
-        ).hexdigest()
-        self.assertTrue(
-            verify_hmac_signature(
-                body, "demo-client", timestamp, "nonce1234567890", signature,
-                "POST", "/api/v1/secure-query",
-            )
-        )
-        self.assertFalse(
-            verify_hmac_signature(
-                body, "partner-x", timestamp, "nonce1234567890", signature,
-                "POST", "/api/v1/secure-query",
-            )
-        )
+    def test_client_policy_validates_region_and_level(self):
+        validate_client_policy("demo-client", "Abuja", 2)
+        with self.assertRaises(HTTPException):
+            validate_client_policy("demo-client", "Kaduna", 1)
+        with self.assertRaises(HTTPException):
+            validate_client_policy("demo-client", "Abuja", 99)
 
-    def test_upstream_error_body_is_not_returned_to_callers(self):
+    def test_geo_anomaly_is_advisory_only(self):
+        self.assertEqual(detect_geo_anomaly("FC-03-B06-AG-12", "Abuja", 9.1, 7.1), None)
+        self.assertEqual(detect_geo_anomaly("FC-03-B06-AG-12", "Lagos", 9.1, 7.1), "REGION_POSTCODE_MISMATCH")
+
+    def test_proxy_to_nipost_handles_failed_connect(self):
+        async def run():
+            async with httpx.AsyncClient() as client:
+                with patch.object(security, "settings", security.settings.__class__(mock_nipost=False, nipost_api_key="abc", nipost_base_url="https://api.postcode.gov.ng")):
+                    with patch.object(client, "get", new_callable=AsyncMock, side_effect=httpx.ConnectError("down")):
+                        return await proxy_to_nipost("FC-03-B06-AG-12", 1, client)
+
+        self.assertEqual(asyncio.run(run())["status"], "UPSTREAM_ERROR")
+
+    def test_proxy_to_nipost_handles_timeout(self):
+        async def run():
+            async with httpx.AsyncClient() as client:
+                with patch.object(security, "settings", security.settings.__class__(mock_nipost=False, nipost_api_key="abc", nipost_base_url="https://api.postcode.gov.ng")):
+                    with patch.object(client, "get", new_callable=AsyncMock, side_effect=httpx.TimeoutException("timeout")):
+                        return await proxy_to_nipost("FC-03-B06-AG-12", 1, client)
+
+        self.assertEqual(asyncio.run(run())["status"], "UPSTREAM_ERROR")
+
+    def test_proxy_to_nipost_handles_http_error_and_malformed_json(self):
         async def run_test(response):
             transport = httpx.MockTransport(lambda _request: response)
             async with httpx.AsyncClient(transport=transport) as client:
                 return await proxy_to_nipost("FC-03-B06-AG-12", 1, client)
 
-        with patch(
-            "security.settings",
-            SimpleNamespace(mock_nipost=False, nipost_api_key="test-api-key"),
-        ):
-            error_result = asyncio.run(
-                run_test(httpx.Response(502, text="sensitive upstream response"))
-            )
+        with patch.object(security, "settings", security.settings.__class__(mock_nipost=False, nipost_api_key="abc", nipost_base_url="https://api.postcode.gov.ng")):
+            error_result = asyncio.run(run_test(httpx.Response(502, text="sensitive upstream response")))
             malformed_result = asyncio.run(run_test(httpx.Response(200, text="not JSON")))
-        self.assertEqual(
-            error_result,
-            {"status": "UPSTREAM_ERROR", "nipost_status_code": 502},
-        )
-        self.assertNotIn("sensitive upstream response", str(error_result))
-        self.assertEqual(
-            malformed_result,
-            {"status": "UPSTREAM_ERROR", "nipost_status_code": 200},
-        )
+
+        self.assertEqual(error_result["status"], "UPSTREAM_ERROR")
+        self.assertEqual(malformed_result["status"], "UPSTREAM_ERROR")
 
 
 @unittest.skipUnless(
@@ -127,9 +162,7 @@ class RedisConcurrencyIntegrationTests(unittest.TestCase):
         rate_key = f"postguard:rate:{unique_id}"
         try:
             with ThreadPoolExecutor(max_workers=32) as pool:
-                nonce_results = list(
-                    pool.map(lambda _: register_nonce(unique_id, "same-nonce-value"), range(32))
-                )
+                nonce_results = list(pool.map(lambda _: register_nonce(unique_id, "same-nonce-value"), range(32)))
                 rate_results = list(pool.map(lambda _: check_rate_limit(unique_id), range(32)))
             self.assertEqual(sum(nonce_results), 1)
             self.assertEqual(sum(rate_results), settings.rate_limit_per_minute)

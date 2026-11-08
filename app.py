@@ -1,7 +1,9 @@
 import json
 import logging
 import re
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, status
@@ -13,14 +15,27 @@ from security import (
     check_rate_limit,
     detect_geo_anomaly,
     is_allowed_client,
+    normalize_region,
     proxy_to_nipost,
     register_nonce,
     validate_client_policy,
+    validate_nonce_format,
     verify_hmac_signature,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("PostGuard-NG")
+
+
+def emit_event(level: str, event: str, request_id: str | None = None, **fields):
+    payload = {"timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "level": level, "event": event}
+    if request_id:
+        payload["request_id"] = request_id
+    for key, value in fields.items():
+        if value is None:
+            continue
+        payload[key] = value
+    logger.log({"INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}.get(level.upper(), 20), json.dumps(payload, separators=(",", ":"), ensure_ascii=True))
 
 
 @asynccontextmanager
@@ -40,12 +55,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-if settings.required:
-    missing = ", ".join(settings.required)
-    raise RuntimeError(f"Missing required environment variables: {missing}")
 
 _CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
-_NONCE_PATTERN = re.compile(r"^[A-Za-z0-9._~-]+$")
 _SIGNATURE_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
@@ -113,7 +124,7 @@ class PostcodeQuery(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     postcode: str = Field(..., min_length=8, max_length=30, example="FC-03-B06-AG-12")
-    level: int = Field(1, ge=1, le=5)
+    level: int = Field(1, ge=1)
     client_lat: float = Field(..., ge=-90.0, le=90.0)
     client_lon: float = Field(..., ge=-180.0, le=180.0)
     declared_region: str = Field(..., min_length=2, max_length=50)
@@ -121,12 +132,18 @@ class PostcodeQuery(BaseModel):
     @field_validator("postcode")
     @classmethod
     def validate_postcode(cls, value: str) -> str:
-        return value.strip().upper()
+        postcode = value.strip().upper()
+        if not re.fullmatch(r"[A-Z0-9-]+", postcode):
+            raise ValueError("postcode contains unsupported characters.")
+        return postcode
 
     @field_validator("declared_region")
     @classmethod
     def validate_region(cls, value: str) -> str:
-        return value.strip()
+        region = value.strip()
+        if not region:
+            raise ValueError("declared_region is required.")
+        return region
 
 
 @app.get("/")
@@ -140,10 +157,23 @@ async def root():
 
 @app.get("/health")
 async def health_check():
+    ready = True
+    redis_status = "unknown"
+    try:
+        from security import redis_client
+        redis_status = "ok" if redis_client.ping() else "unavailable"
+        ready = ready and redis_status == "ok"
+    except Exception:
+        redis_status = "unavailable"
+        ready = False
+
+    upstream_status = "mock_mode" if settings.mock_nipost else "not_checked"
+    upstream_reachable = settings.mock_nipost
     return {
-        "system": settings.app_name,
-        "status": "Operational",
-        "target_infrastructure": "https://api.postcode.gov.ng",
+        "status": "ok" if ready else "degraded",
+        "liveness": {"ok": True},
+        "readiness": {"ready": ready, "redis": redis_status},
+        "upstream": {"mode": upstream_status, "reachable": upstream_reachable},
         "protection_active": [
             "HMAC-SHA256 request integrity",
             "Redis-backed rate limiting",
@@ -158,19 +188,28 @@ async def health_check():
 async def secure_postcode_query(
     query: PostcodeQuery,
     request: Request,
-    x_client_id: str = Header(..., alias="X-Client-ID", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$"),
-    x_timestamp: str = Header(..., alias="X-Timestamp", min_length=1, max_length=12, pattern=r"^[0-9]+$"),
-    x_nonce: str = Header(..., alias="X-Nonce", min_length=16, max_length=128, pattern=r"^[A-Za-z0-9._~-]+$"),
-    x_signature: str = Header(..., alias="X-Signature", min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$"),
+    x_client_id: str = Header(..., alias="X-Client-ID"),
+    x_timestamp: str = Header(..., alias="X-Timestamp"),
+    x_nonce: str = Header(..., alias="X-Nonce"),
+    x_signature: str = Header(..., alias="X-Signature"),
 ):
+    request_id = uuid.uuid4().hex
     client_ip = request.client.host if request.client else "unknown"
 
-    # 1. Validate client identity
+    if not re.fullmatch(r"^[A-Za-z0-9._-]+$", x_client_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed client ID.")
+    if not x_timestamp or not x_timestamp.isascii() or not x_timestamp.isdigit() or len(x_timestamp) > 12:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed timestamp.")
+    if not validate_nonce_format(x_nonce):
+        emit_event("WARNING", "INVALID_NONCE", request_id=request_id, client_id=x_client_id, ip=client_ip)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed nonce value.")
+    if not re.fullmatch(r"^[0-9a-fA-F]{64}$", x_signature):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed signature.")
+
     if not is_allowed_client(x_client_id):
-        logger.warning(json.dumps({"event": "UNKNOWN_CLIENT", "client_id": x_client_id, "ip": client_ip}))
+        emit_event("WARNING", "UNKNOWN_CLIENT", request_id=request_id, client_id=x_client_id, ip=client_ip)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unknown client ID.")
 
-    # 2. Verify signature before consuming nonce or rate-limit capacity.
     raw_body = await request.body()
     if not verify_hmac_signature(
         raw_body,
@@ -181,54 +220,54 @@ async def secure_postcode_query(
         request.method,
         request.url.path,
     ):
-        logger.critical(json.dumps({"event": "PAYLOAD_TAMPERING_DETECTED", "client_id": x_client_id, "ip": client_ip}))
+        emit_event("CRITICAL", "INVALID_SIGNATURE", request_id=request_id, client_id=x_client_id, ip=client_ip, path=request.url.path)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid HMAC signature.")
 
-    # 3. Enforce client policy before consuming request quota.
-    validate_client_policy(x_client_id, query.declared_region, query.level)
+    try:
+        validate_client_policy(x_client_id, query.declared_region, query.level)
+    except HTTPException:
+        emit_event("WARNING", "CLIENT_POLICY_VIOLATION", request_id=request_id, client_id=x_client_id, region=normalize_region(query.declared_region), lookup_level=query.level)
+        raise
 
-    # 4. Prevent replay.
     if not register_nonce(x_client_id, x_nonce):
-        logger.warning(json.dumps({"event": "REPLAY_DETECTED", "client_id": x_client_id, "ip": client_ip}))
+        emit_event("WARNING", "REPLAY_DETECTED", request_id=request_id, client_id=x_client_id, ip=client_ip)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Replay detected. Nonce already used.")
 
-    # 5. Enforce rate limit.
-    if not check_rate_limit(x_client_id):
-        logger.warning(json.dumps({"event": "RATE_LIMIT_EXCEEDED", "client_id": x_client_id, "ip": client_ip}))
+    try:
+        allowed = check_rate_limit(x_client_id)
+    except HTTPException:
+        emit_event("ERROR", "RATE_LIMIT_CHECK_FAILED", request_id=request_id, client_id=x_client_id)
+        raise
+
+    if not allowed:
+        emit_event("WARNING", "RATE_LIMIT_EXCEEDED", request_id=request_id, client_id=x_client_id, ip=client_ip)
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded.")
 
-    # Client-provided coordinates are untrusted; use the result for monitoring only.
     geo_issue = detect_geo_anomaly(query.postcode, query.declared_region, query.client_lat, query.client_lon)
     if geo_issue:
-        logger.warning(json.dumps({
-            "event": geo_issue,
-            "client_id": x_client_id,
-            "postcode": query.postcode,
-            "declared_region": query.declared_region,
-            "ip": client_ip,
-        }))
+        emit_event("WARNING", geo_issue, request_id=request_id, client_id=x_client_id, postcode=query.postcode, region=normalize_region(query.declared_region), ip=client_ip)
 
-    # 7. Proxy upstream
     upstream_result = await proxy_to_nipost(query.postcode, query.level, request.app.state.http_client)
     if upstream_result["status"] == "UPSTREAM_ERROR":
+        emit_event("ERROR", "UPSTREAM_FAILURE", request_id=request_id, client_id=x_client_id, postcode=query.postcode, upstream_status=upstream_result.get("status_code"))
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={
-                "message": "NIPOST request failed.",
-                "upstream_status_code": upstream_result.get("nipost_status_code"),
+                "message": "Upstream lookup failed.",
+                "upstream_status_code": upstream_result.get("status_code"),
             },
         )
 
-    logger.info(json.dumps({
-        "event": "REQUEST_PASSED_AND_PROXIED",
-        "client_id": x_client_id,
-        "postcode": query.postcode,
-        "ip": client_ip,
-    }))
+    emit_event("INFO", "REQUEST_ACCEPTED", request_id=request_id, client_id=x_client_id, postcode=query.postcode, upstream_source=upstream_result.get("source", "mock"))
 
     return {
         "status": "SUCCESS",
-        "security_score": "100%",
-        "shield": "PostGuard NG Firewall Active",
+        "security": {
+            "authentication": "verified",
+            "replay_protection": "enforced",
+            "rate_limit": "enforced",
+            "geo_checks": "advisory",
+            "upstream_source": upstream_result.get("source", "mock"),
+        },
         "nipost_data": upstream_result["nipost_data"],
     }
