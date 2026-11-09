@@ -72,6 +72,13 @@ class Settings:
     admin_login_attempts: int = _env_positive_int("ADMIN_LOGIN_ATTEMPTS", 5)
     admin_login_window_seconds: int = _env_positive_int("ADMIN_LOGIN_WINDOW_SECONDS", 900)
 
+    # Optional OpenAI-compatible threat investigation; disabled unless explicitly enabled.
+    intelligence_enabled: bool = _env_bool("INTELLIGENCE_ENABLED", False)
+    intelligence_base_url: str = os.getenv("INTELLIGENCE_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+    intelligence_api_key: str = os.getenv("INTELLIGENCE_API_KEY", "").strip()
+    intelligence_model: str = os.getenv("INTELLIGENCE_MODEL", "").strip()
+    intelligence_timeout_seconds: int = _env_positive_int("INTELLIGENCE_TIMEOUT_SECONDS", 15)
+
     # Security parameters
     max_clock_skew_seconds: int = _env_positive_int("MAX_CLOCK_SKEW_SECONDS", 120)
     nonce_ttl_seconds: int = _env_positive_int("NONCE_TTL_SECONDS", 300)
@@ -158,6 +165,32 @@ class Settings:
             raise RuntimeError("ADMIN_USERNAME and ADMIN_PASSWORD must be configured together.")
         if self.admin_password and len(self.admin_password) < 16:
             raise RuntimeError("ADMIN_PASSWORD must contain at least 16 characters.")
+
+        if self.intelligence_enabled:
+            if not self.intelligence_api_key or len(self.intelligence_api_key) > 4096:
+                raise RuntimeError("INTELLIGENCE_API_KEY is required when INTELLIGENCE_ENABLED=true.")
+            if not self.intelligence_model or len(self.intelligence_model) > 128:
+                raise RuntimeError("INTELLIGENCE_MODEL is required when INTELLIGENCE_ENABLED=true.")
+            try:
+                intelligence_url = urlsplit(self.intelligence_base_url)
+                intelligence_port = intelligence_url.port
+            except ValueError as exc:
+                raise RuntimeError("INTELLIGENCE_BASE_URL must be a valid absolute URL.") from exc
+            local_http = intelligence_url.scheme == "http" and intelligence_url.hostname in {
+                "localhost", "127.0.0.1", "::1",
+            }
+            if (
+                not intelligence_url.hostname
+                or intelligence_url.username
+                or intelligence_url.password
+                or intelligence_url.query
+                or intelligence_url.fragment
+                or intelligence_port == 0
+                or (intelligence_url.scheme != "https" and not local_http)
+            ):
+                raise RuntimeError(
+                    "INTELLIGENCE_BASE_URL must use HTTPS, except for a local development endpoint."
+                )
 
         try:
             upstream = urlsplit(self.nipost_base_url)

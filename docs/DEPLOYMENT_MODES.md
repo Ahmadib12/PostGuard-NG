@@ -5,9 +5,9 @@ PostGuard-NG currently supports a **customer-hosted, single-operator installatio
 | Mode | Current status | Meaning |
 | --- | --- | --- |
 | Customer-hosted | Deployment path provided | The operator runs the gateway, Redis, and telemetry database in infrastructure they control. |
-| Managed | Not implemented | There is no hosted service, tenant provisioning, tenant membership/RBAC, per-tenant credentials/upstreams, or managed control plane. Setting `POSTGUARD_DEPLOYMENT_MODE=managed` does not enable any of these. |
+| Managed | Not a hosted service | Administrator IAM, organization memberships/roles, organization provisioning/status controls, and scoped dashboard APIs exist. There is no hosted service, tenant-specific client policy/secrets/upstreams, managed control plane, or managed operations. Setting `POSTGUARD_DEPLOYMENT_MODE=managed` does not provide these. |
 
-The application still uses a static in-process client policy and client secrets loaded from environment variables. Telemetry and administrator sessions have organization ownership fields and organization-scoped queries; the single configured administrator is bound to `POSTGUARD_ORGANIZATION_ID`. `POSTGUARD_CLIENT_ORGANIZATIONS` is a server-side map used to scope client telemetry. This is only an isolation foundation: there is no tenant membership/RBAC, tenant-aware administrator login, provisioning workflow, platform administration, or per-tenant upstream/client credential lifecycle. Do not use one shared instance to serve mutually untrusted organizations as if it were a complete multi-tenant service.
+The application still uses a static in-process client policy and client secrets loaded from environment variables. `POSTGUARD_CLIENT_ORGANIZATIONS` is a server-side map used to assign authenticated clients to organizations. IAM login selects an organization membership, and dashboard queries and administrative operations are scoped to that session. Organization suspension blocks mapped client requests and ordinary tenant administration. This is not a complete multi-tenant service: client provisioning, tenant-specific credentials/upstreams, and managed hosting/operations are not provided. Do not use one shared instance to serve mutually untrusted organizations without independently reviewing those boundaries.
 
 ## Choosing a mode
 

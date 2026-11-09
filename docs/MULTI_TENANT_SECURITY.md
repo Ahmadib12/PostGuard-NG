@@ -1,8 +1,8 @@
 # Multi-tenant security status
 
-**Current state: partial telemetry scoping only; multi-tenancy is not implemented.** PostGuard-NG remains an installation-level gateway, not a multi-tenant service. The deployment-mode configuration does not create a tenant boundary.
+**Current state: organization-scoped IAM and dashboard operations, with significant multi-tenant gaps.** PostGuard-NG remains an installation-level gateway, not a hosted multi-tenant service. The deployment-mode configuration does not create infrastructure or a complete tenant boundary.
 
-The schema gives telemetry and sessions an organization ID, and protected dashboard queries use the organization ID stored in the administrator's session. Client telemetry can be mapped to organizations by trusted server configuration. The application still has one configured administrator identity, no tenant membership/RBAC, and static environment-based client policies/secrets. It does not provide tenant provisioning, per-tenant upstream credentials, tenant-specific retention, managed support controls, or platform administration. A client ID is not by itself a tenant identity.
+The schema gives telemetry, incidents, audit records, and administrator sessions an organization ID. Administrators have organization memberships and server-enforced roles/permissions, and platform administrators can provision or suspend organizations. Client ownership comes from a trusted server-side client-ID mapping, while client policies and secrets remain static environment configuration. There are no per-tenant upstream credentials, tenant-specific retention, managed support controls, or hosted control plane. A client ID is not by itself a tenant identity.
 
 ## Deployment rule
 

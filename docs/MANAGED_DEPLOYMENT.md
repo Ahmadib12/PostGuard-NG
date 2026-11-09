@@ -2,7 +2,7 @@
 
 **Status: not implemented.** This document records prerequisites and must not be read as an offer or guide for an available hosted service. The `managed` value of `POSTGUARD_DEPLOYMENT_MODE` is a configuration label only. It does not create a service, tenant boundary, or managed operations capability.
 
-The current application has a static in-process client policy and environment-loaded secrets. Organization-owned telemetry and organization-scoped queries exist as an initial foundation, with server-side client-to-organization configuration. Administrator authentication still has one configured identity bound to one organization; there is no tenant membership/RBAC, tenant provisioning, per-tenant client credential/provider lifecycle, or managed control plane. There is also no billing, service-level commitment, or production hosting runbook in this repository.
+The application has organization-aware IAM, role-scoped dashboard operations, platform-level organization provisioning/suspension, and server-side client-to-organization configuration. Client policies and secrets are still static environment configuration; there is no tenant-specific client credential/upstream lifecycle, hosted control plane, billing, service-level commitment, or production hosting runbook in this repository.
 
 ## Required before offering a managed service
 

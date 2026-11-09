@@ -29,6 +29,8 @@ MIGRATION_0001 = load_migration("0001_dashboard_telemetry")
 MIGRATION_0002 = load_migration("0002_generated_admin_credential")
 MIGRATION_0003 = load_migration("0003_organization_scopes")
 MIGRATION_0004 = load_migration("0004_validate_legacy_tenant_scopes")
+MIGRATION_0005 = load_migration("0005_administrator_iam")
+MIGRATION_0006 = load_migration("0006_security_incidents")
 
 
 class TenantMigrationTests(unittest.TestCase):
@@ -136,6 +138,34 @@ class TenantMigrationTests(unittest.TestCase):
             self.connection.execute(text("SELECT details FROM audit_logs")).scalar_one(),
             '{"result":"ok"}',
         )
+
+    def test_audit_chain_backfill_normalizes_sqlite_timestamps_and_is_retry_safe(self):
+        self.insert_legacy_data()
+        with self.migration_environment("customer-a"):
+            self.run_migration(MIGRATION_0003)
+            self.run_migration(MIGRATION_0004)
+        self.run_migration(MIGRATION_0005)
+
+        row = dict(self.connection.execute(text(
+            "SELECT id, organization_id, timestamp, actor, action, details, sequence, "
+            "previous_digest, digest FROM audit_logs"
+        )).mappings().one())
+        self.assertEqual(row["sequence"], 1)
+        self.assertEqual(row["previous_digest"], "0" * 64)
+        self.assertEqual(
+            row["digest"],
+            MIGRATION_0005._digest(row, 1, "0" * 64),
+        )
+        self.run_migration(MIGRATION_0005)
+        self.assertEqual(
+            self.connection.execute(
+                text("SELECT sequence, digest FROM audit_chain_state WHERE id=1")
+            ).one(),
+            (1, row["digest"]),
+        )
+        self.connection.execute(text("UPDATE audit_logs SET previous_digest=NULL"))
+        with self.assertRaisesRegex(RuntimeError, "partially populated"):
+            self.run_migration(MIGRATION_0005)
 
     def test_client_mapping_assigns_known_records_and_preserves_existing_organization(self):
         self.connection.execute(text(
@@ -418,7 +448,7 @@ class TenantMigrationTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     database.execute("SELECT version_num FROM alembic_version").fetchone(),
-                    (MIGRATION_0004.revision,),
+                    (MIGRATION_0006.revision,),
                 )
 
     def test_alembic_upgrade_from_previous_schema_preserves_customer_data(self):
@@ -513,7 +543,7 @@ class TenantMigrationTests(unittest.TestCase):
             with sqlite3.connect(database_path) as database:
                 self.assertEqual(
                     database.execute("SELECT version_num FROM alembic_version").fetchone(),
-                    (MIGRATION_0004.revision,),
+                    (MIGRATION_0006.revision,),
                 )
                 self.assertEqual(
                     database.execute(

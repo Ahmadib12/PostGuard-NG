@@ -12,17 +12,24 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from admin_api import router as admin_router
 from config import settings
 from dashboard_store import (
-    initialize_admin_credentials,
     initialize_database,
     initialize_organizations,
-    discard_admin_credentials,
+    organization_for_client,
     record_request,
     record_security_event,
+    verify_audit_chain,
+)
+from iam import (
+    bootstrap_platform_admin,
+    create_generated_platform_admin,
+    discard_bootstrap_admin,
+    organization_is_active,
 )
 from security import (
     check_rate_limit_and_register_nonce,
@@ -56,16 +63,31 @@ def _write_bootstrap_credentials(username: str, password: str, destination: str 
     return path
 
 
+def _client_organization_status(client_id: str) -> tuple[str, bool]:
+    organization_id = organization_for_client(client_id)
+    try:
+        return organization_id, organization_is_active(organization_id)
+    except (RuntimeError, SQLAlchemyError) as exc:
+        logger.exception("Could not verify the authenticated client's organization status.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Organization status is temporarily unavailable.",
+        ) from exc
+
+
 async def emit_event(
     level: str,
     event: str,
     request_id: str | None = None,
     http_status: int | None = None,
+    verified_client_id: str | None = None,
     **fields,
 ):
     payload = {"timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "level": level, "event": event}
     if request_id:
         payload["request_id"] = request_id
+    if verified_client_id:
+        payload["client_id"] = verified_client_id
     for key, value in fields.items():
         if value is None:
             continue
@@ -73,12 +95,11 @@ async def emit_event(
     logger.log({"INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}.get(level.upper(), 20), json.dumps(payload, separators=(",", ":"), ensure_ascii=True))
     try:
         event_fields = dict(fields)
-        client_id = event_fields.pop("client_id", None)
         await asyncio.to_thread(
             record_security_event,
             event,
             request_id,
-            client_id,
+            verified_client_id,
             http_status,
             **event_fields,
         )
@@ -89,27 +110,38 @@ async def emit_event(
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     await asyncio.to_thread(initialize_database)
+    if not await asyncio.to_thread(verify_audit_chain):
+        raise RuntimeError("Audit log integrity verification failed; refusing to start.")
     await asyncio.to_thread(initialize_organizations)
-    generated_admin = await asyncio.to_thread(initialize_admin_credentials)
+    generated_admin = None
+    if settings.admin_username and settings.admin_password:
+        await asyncio.to_thread(
+            bootstrap_platform_admin,
+            settings.admin_username,
+            settings.admin_password,
+        )
+    else:
+        generated_admin = await asyncio.to_thread(create_generated_platform_admin)
     if generated_admin:
+        admin_id, admin_username, admin_password = generated_admin
         try:
             credential_file = await asyncio.to_thread(
                 _write_bootstrap_credentials,
-                generated_admin[0],
-                generated_admin[1],
+                admin_username,
+                admin_password,
                 settings.admin_bootstrap_file,
             )
         except OSError:
             await asyncio.to_thread(
-                discard_admin_credentials,
-                generated_admin[0],
-                generated_admin[1],
+                discard_bootstrap_admin,
+                admin_id,
+                admin_password,
             )
             raise
         logger.warning(
             "Initial administrator credentials (shown once): username=%s password=%s. "
             "Bootstrap credentials were written to %s with owner-only permissions; configure the environment and remove the file.",
-            generated_admin[0],
+            admin_username,
             credential_file,
         )
     async with httpx.AsyncClient(
@@ -136,7 +168,6 @@ if settings.trusted_hosts:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.trusted_hosts))
 
 
-_CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 _SIGNATURE_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
@@ -230,9 +261,7 @@ class RequestTelemetryMiddleware:
         try:
             await self.application(scope, receive, capture_status)
         finally:
-            headers = dict(scope.get("headers", []))
-            raw_client_id = headers.get(b"x-client-id", b"").decode("ascii", "ignore")
-            client_id = raw_client_id if _CLIENT_ID_PATTERN.fullmatch(raw_client_id) else None
+            client_id = state.get("authenticated_client_id")
             duration_ms = max(0, int((asyncio.get_running_loop().time() - started) * 1000))
             try:
                 await asyncio.to_thread(
@@ -376,13 +405,13 @@ async def secure_postcode_query(
     if not x_timestamp or not x_timestamp.isascii() or not x_timestamp.isdigit() or len(x_timestamp) > 12:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed timestamp.")
     if not validate_nonce_format(x_nonce):
-        await emit_event("WARNING", "INVALID_NONCE", request_id=request_id, http_status=400, client_id=x_client_id)
+        await emit_event("WARNING", "INVALID_NONCE", request_id=request_id, http_status=400)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed nonce value.")
     if not re.fullmatch(r"^[0-9a-fA-F]{64}$", x_signature):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed signature.")
 
     if not is_allowed_client(x_client_id):
-        await emit_event("WARNING", "UNKNOWN_CLIENT", request_id=request_id, http_status=401, client_id=x_client_id)
+        await emit_event("WARNING", "UNKNOWN_CLIENT", request_id=request_id, http_status=401)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unknown client ID.")
 
     raw_body = await request.body()
@@ -395,10 +424,21 @@ async def secure_postcode_query(
         request.method,
         request.url.path,
     ):
-        await emit_event("CRITICAL", "INVALID_SIGNATURE", request_id=request_id, http_status=403, client_id=x_client_id, path=request.url.path)
+        await emit_event("CRITICAL", "INVALID_SIGNATURE", request_id=request_id, http_status=403, path=request.url.path)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid HMAC signature.")
 
     request.state.authenticated = True
+    request.state.authenticated_client_id = x_client_id
+    _, organization_active = await asyncio.to_thread(_client_organization_status, x_client_id)
+    if not organization_active:
+        await emit_event(
+            "WARNING",
+            "ORGANIZATION_SUSPENDED",
+            request_id=request_id,
+            http_status=403,
+            verified_client_id=x_client_id,
+        )
+        raise HTTPException(status_code=403, detail="Client organization is suspended.")
     try:
         validate_client_policy(x_client_id, query.declared_region, query.level)
     except HTTPException:
@@ -407,7 +447,7 @@ async def secure_postcode_query(
             "CLIENT_POLICY_VIOLATION",
             request_id=request_id,
             http_status=403,
-            client_id=x_client_id,
+            verified_client_id=x_client_id,
             region=normalize_region(query.declared_region),
             lookup_level=query.level,
         )
@@ -420,19 +460,19 @@ async def secure_postcode_query(
             x_nonce,
         )
     except HTTPException:
-        await emit_event("ERROR", "REDIS_FAILURE", request_id=request_id, http_status=503, client_id=x_client_id, component="request_controls")
+        await emit_event("ERROR", "REDIS_FAILURE", request_id=request_id, http_status=503, verified_client_id=x_client_id, component="request_controls")
         raise
 
     if request_control_result == "rate_limited":
-        await emit_event("WARNING", "RATE_LIMIT_EXCEEDED", request_id=request_id, http_status=429, client_id=x_client_id)
+        await emit_event("WARNING", "RATE_LIMIT_EXCEEDED", request_id=request_id, http_status=429, verified_client_id=x_client_id)
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded.")
 
     if request_control_result == "replay":
-        await emit_event("WARNING", "REPLAY_DETECTED", request_id=request_id, http_status=409, client_id=x_client_id)
+        await emit_event("WARNING", "REPLAY_DETECTED", request_id=request_id, http_status=409, verified_client_id=x_client_id)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Replay detected. Nonce already used.")
 
     if request_control_result != "allowed":
-        await emit_event("ERROR", "REDIS_FAILURE", request_id=request_id, http_status=503, client_id=x_client_id, component="request_controls")
+        await emit_event("ERROR", "REDIS_FAILURE", request_id=request_id, http_status=503, verified_client_id=x_client_id, component="request_controls")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Request security service is temporarily unavailable.",
@@ -444,7 +484,7 @@ async def secure_postcode_query(
             "WARNING",
             geo_issue,
             request_id=request_id,
-            client_id=x_client_id,
+            verified_client_id=x_client_id,
             region=normalize_region(query.declared_region),
         )
 
@@ -455,7 +495,7 @@ async def secure_postcode_query(
             "UPSTREAM_FAILURE",
             request_id=request_id,
             http_status=502,
-            client_id=x_client_id,
+            verified_client_id=x_client_id,
             upstream_status=upstream_result.get("status_code"),
         )
         raise HTTPException(

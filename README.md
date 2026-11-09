@@ -92,7 +92,7 @@ Important: the current implementation is mock-first. The app supports mock mode 
 
 ## Environment variables
 
-`POSTGUARD_DEPLOYMENT_MODE` selects `customer_hosted` (default) or `managed`. Tenant ownership columns, server-side client-to-organization configuration, and organization-scoped telemetry/session queries provide an initial isolation foundation. This is not a complete managed multi-tenant service: tenant membership/RBAC, tenant provisioning, per-tenant credentials/upstreams, and platform administration are not implemented. Do not share one installation across mutually untrusted organizations. See [docs/DEPLOYMENT_MODES.md](./docs/DEPLOYMENT_MODES.md) for the implementation status.
+`POSTGUARD_DEPLOYMENT_MODE` selects `customer_hosted` (default) or `managed`; it does not provision infrastructure. Administrator IAM now supports organization memberships, role-based permissions, platform administration, organization suspension, and scoped dashboard queries. Client policy and secrets remain static deployment configuration, and the repository does not provide a hosted control plane, tenant-specific upstreams, or a full managed-service boundary. Do not treat the `managed` label as a hosted or independently audited multi-tenant service. See [docs/DEPLOYMENT_MODES.md](./docs/DEPLOYMENT_MODES.md) and [docs/TENANT_ISOLATION.md](./docs/TENANT_ISOLATION.md).
 
 Create a local `.env` from `.env.example`, replace placeholders, and keep secrets out of source control. Configure a separate administrator username and password; client HMAC credentials are never administrator credentials.
 
@@ -114,12 +114,21 @@ ADMIN_SESSION_TTL_SECONDS=3600
 ADMIN_COOKIE_SECURE=false
 ADMIN_LOGIN_ATTEMPTS=5
 ADMIN_LOGIN_WINDOW_SECONDS=900
+INTELLIGENCE_ENABLED=false
+INTELLIGENCE_BASE_URL=https://api.openai.com/v1
+INTELLIGENCE_API_KEY=
+INTELLIGENCE_MODEL=
+INTELLIGENCE_TIMEOUT_SECONDS=15
 POSTGUARD_DEMO_CLIENT_SECRET=replace-me-with-a-32-byte-secret
 POSTGUARD_PARTNER_X_SECRET=replace-me-with-a-different-32-byte-secret
 NIPOST_API_KEY=live-key-only-when-not-using-mock-mode
 ```
 
-`ADMIN_PASSWORD` must contain at least 16 characters. The example disables the Secure cookie flag only for local HTTP development; set `ADMIN_COOKIE_SECURE=true` behind HTTPS in every deployed environment. When both admin variables are blank, the first backend startup generates a unique `admin` password and stores only its salted scrypt hash in the database. The one-time bootstrap credentials are written to `ADMIN_BOOTSTRAP_FILE` (default `.admin-bootstrap-credential`) with owner-only permissions, not to application logs. Read and securely store them, configure `ADMIN_USERNAME` and `ADMIN_PASSWORD` in `.env`, restart, and then remove the bootstrap file securely. The database stores only password hashes and hashed random session/CSRF tokens.
+`ADMIN_PASSWORD` must contain at least 16 characters. The example disables the Secure cookie flag only for local HTTP development; set `ADMIN_COOKIE_SECURE=true` behind HTTPS in every deployed environment. On first startup, configured `ADMIN_USERNAME` and `ADMIN_PASSWORD` bootstrap a platform administrator only if no IAM account exists. If both are blank, development startup generates a unique `platform-admin` credential and writes it to `ADMIN_BOOTSTRAP_FILE` (default `.admin-bootstrap-credential`) with owner-only permissions. Configure the environment and remove that file securely after use. This explicit bootstrap does not migrate or authenticate the legacy singleton credential; its historical database row is left untouched. Later environment changes do not reset existing IAM passwords. New organization administrators receive one-time temporary passwords and must change them at first sign-in. Passwords are stored as salted scrypt hashes and random session/CSRF tokens as hashes.
+
+The administrator dashboard supports role-scoped access, account lifecycle, organization provisioning/suspension, a hash-chained audit log, and deterministic, deduplicated incident triage. Startup verifies the audit chain and refuses to run on detected corruption. The chain is stored in the application database; operators should restrict database access and retain independent backups.
+
+AI investigation is optional and disabled by default. To enable it, configure `INTELLIGENCE_ENABLED=true`, `INTELLIGENCE_BASE_URL`, `INTELLIGENCE_API_KEY`, and `INTELLIGENCE_MODEL`. The configured endpoint must use HTTPS, except for loopback development endpoints. Only aggregate incident type, severity, risk score, and occurrence counts are sent; client IDs, request IDs, event metadata, and request bodies are excluded. Results are validated, rate-limited, and recommendation-only; no action is executed automatically. Enabling this feature transmits aggregate security telemetry to the provider you configure. Review the provider's privacy and retention terms first.
 
 Mock upstream mode defaults to enabled when `MOCK_NIPOST` is omitted. For production, set `APP_ENV=production`, `DEBUG=false`, `MOCK_NIPOST` explicitly, `ADMIN_COOKIE_SECURE=true`, and `TRUSTED_HOSTS` to a comma-separated list of the exact hostnames serving the application. Production startup rejects wildcard/empty trusted hosts, missing administrator credentials, and insecure live upstream URLs. API documentation routes are disabled in production. Configure TLS at the trusted ingress and serve the dashboard and API from the same origin; do not rely on the Vite development server for deployment.
 
@@ -175,9 +184,9 @@ Open the Vite URL (normally `http://localhost:5173`). The development server pro
 
 The backend sends restrictive security headers, disables caching on administrator API responses, validates JSON content type for secure queries, and echoes an opaque request ID in `X-Request-ID`. The live upstream response body is capped by `MAX_UPSTREAM_RESPONSE_BYTES` (default 1 MiB); redirects are disabled and ambient proxy environment variables are ignored. Configure outbound network policy at the deployment boundary so the backend can reach only the intended upstream; DNS/private-network egress policy remains an infrastructure responsibility.
 
-The UI polls the active dashboard view every 30 seconds; manually refresh with the top-bar refresh button. Available views include request overview/analytics, configured client activity, blocked requests, replay reports, suspicious events, dependency health, and admin audit history.
+The UI polls the active dashboard view every 30 seconds; manually refresh with the top-bar refresh button. Available views include request overview/analytics, configured client activity, blocked requests, replay reports, suspicious events, deterministic threat triage, optional AI recommendations, administrator and organization management, dependency health, and audit history. Available navigation and actions are limited by the signed-in administrator's role.
 
-The System health view shows the selected deployment mode. `POSTGUARD_ORGANIZATION_ID` binds the configured administrator session; `POSTGUARD_CLIENT_ORGANIZATIONS` can map authenticated clients to organizations for telemetry. These settings provide limited telemetry/session scoping, not tenant membership, RBAC, per-tenant upstream/client management, or a full tenant isolation boundary. Do not use `managed` to host multiple mutually untrusted organizations.
+The System health view shows the selected deployment mode. `POSTGUARD_ORGANIZATION_ID` identifies the default organization, and `POSTGUARD_CLIENT_ORGANIZATIONS` maps configured client IDs to organizations. These are trusted server-side settings, not tenant claims from requests. IAM and dashboard data access are organization-scoped, but client provisioning, policy, and secrets are still shared deployment configuration. Review the isolation limitations before hosting multiple mutually untrusted organizations.
 
 For a single customer-hosted Docker deployment, see [docs/CUSTOMER_HOSTED_DEPLOYMENT.md](./docs/CUSTOMER_HOSTED_DEPLOYMENT.md). It serves the built dashboard on port 8080 and the API on port 8000, both loopback-bound by default. See [docs/DEPLOYMENT_MODES.md](./docs/DEPLOYMENT_MODES.md), [docs/MANAGED_DEPLOYMENT.md](./docs/MANAGED_DEPLOYMENT.md), [docs/MULTI_TENANT_SECURITY.md](./docs/MULTI_TENANT_SECURITY.md), [docs/TENANT_ISOLATION.md](./docs/TENANT_ISOLATION.md), and [docs/OPERATIONS.md](./docs/OPERATIONS.md) for mode status and operational boundaries.
 
@@ -237,8 +246,12 @@ Administrator routes require the separate session cookie established by `POST /a
 - `GET /api/admin/security/suspicious`
 - `GET /api/admin/health`
 - `GET /api/admin/audit-logs`
+- `GET /api/admin/users`, `POST /api/admin/users`, `PATCH /api/admin/users/{admin_id}`
+- `POST /api/admin/users/{admin_id}/reset-password`, `POST /api/admin/users/{admin_id}/revoke-sessions`
+- `GET /api/admin/organizations`, `POST /api/admin/organizations`, organization `/suspend` and `/restore`
+- `GET /api/admin/intelligence/incidents`, `POST /api/admin/intelligence/investigate`
 
-List APIs are paginated (maximum 100 rows per page); date parameters must be timezone-aware. The client registry remains configuration-backed and read-only in this phase—no client enable/disable or policy editing endpoint is exposed.
+List APIs are paginated (maximum 100 rows per page); date parameters must be timezone-aware. Administrator and organization actions require CSRF validation and are audit-logged. The client registry remains configuration-backed and read-only—no client enable/disable or policy editing endpoint is exposed.
 
 ### Secure postcode lookup
 

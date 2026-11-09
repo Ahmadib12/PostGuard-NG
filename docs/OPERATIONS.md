@@ -20,6 +20,9 @@ This runbook applies to the single-operator customer-hosted Compose deployment. 
 ## Secrets and access
 
 - Keep `.env` owner-readable only and outside version control and image layers. Rotate client/admin credentials through an approved process and restart the service after changing environment configuration.
+- Administrator accounts are IAM records with organization-scoped roles and permissions. Review membership and audit access regularly; disabling an account and resetting its password revoke its active sessions. A temporary password is displayed only in the create/reset response and must be delivered securely.
+- The audit log is hash-chained and verified at startup. Restrict direct database write access: the chain detects ordinary row alteration/deletion but is not an external immutable ledger against an operator who can rewrite the database and recompute the chain. Retain protected independent backups.
+- AI incident investigation is off by default. If enabled, aggregate event categories/counts are sent to the configured OpenAI-compatible endpoint. Confirm provider privacy/retention terms, secure the API key, monitor provider usage, and disable the feature if telemetry must remain local.
 - Restrict host, Docker daemon, database, Redis, logs, and backup access to trusted operators. Do not publish PostgreSQL or Redis ports.
 - Use TLS at a trusted reverse proxy/load balancer and limit access to administrative routes. Keep `TRUSTED_HOSTS` narrow and `ADMIN_COOKIE_SECURE=true`.
 - If credentials may have been exposed, revoke/rotate them, review access and logs, and consider Redis nonce state and database/backups in the response.

@@ -172,6 +172,15 @@ td code { color: #8390a1; font-size: 9px; font-family: "SFMono-Regular", Consola
 .filters { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px 0; margin-bottom: 7px; border-top: 1px solid #f0f2f6; border-bottom: 1px solid #f0f2f6; }
 .filters select, .filter-search, .date-filter { height: 33px; display: flex; align-items: center; border: 1px solid #e6eaf0; border-radius: 6px; background: white; color: #8190a3; font-size: 9px; }
 .filters select { padding: 0 9px; min-width: 120px; }
+.filters input { height: 33px; min-width: 180px; padding: 0 9px; border: 1px solid #e6eaf0; border-radius: 6px; background: white; color: #536176; font-size: 10px; }
+.row-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+.credential-notice { display: flex; align-items: center; gap: 10px; padding: 10px 12px; margin: 10px 0; border: 1px solid #f0dfb8; border-radius: 7px; background: #fffaf0; color: #7d632f; font-size: 10px; }
+.credential-notice code { overflow-wrap: anywhere; color: #26364d; }
+.credential-notice .icon-button { margin-left: auto; }
+.intelligence-note { margin: 10px 0 0; color: #8793a4; font-size: 10px; line-height: 1.6; }
+.incident-result { margin-top: 16px; padding-top: 14px; border-top: 1px solid #edf0f4; color: #536176; font-size: 11px; line-height: 1.6; }
+.incident-result h3 { margin: 8px 0 5px; color: #293951; font-size: 12px; }
+.incident-result ul { padding-left: 18px; }
 .filter-search { padding: 0 9px; gap: 6px; }
 .filter-search input { width: 126px; border: 0; outline: 0; color: #3c4a60; font-size: 9px; }
 .date-filter { gap: 5px; padding: 0 7px; white-space: nowrap; }

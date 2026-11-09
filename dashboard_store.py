@@ -35,6 +35,7 @@ if _url.startswith("sqlite"):
 engine = create_engine(_url, **_engine_options)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 _migration_lock = threading.Lock()
+_audit_lock = threading.Lock()
 
 
 class Base(DeclarativeBase):
@@ -110,6 +111,53 @@ class AdminCredential(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class AdminAccount(Base):
+    __tablename__ = "admin_accounts"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    username: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    password_salt: Mapped[bytes] = mapped_column(LargeBinary(32))
+    password_hash: Mapped[bytes] = mapped_column(LargeBinary(64))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    platform_super_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class OrganizationAdminMembership(Base):
+    __tablename__ = "organization_admin_memberships"
+
+    admin_id: Mapped[str] = mapped_column(
+        ForeignKey("admin_accounts.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    role: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AdminIAMSession(Base):
+    __tablename__ = "admin_iam_sessions"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    csrf_hash: Mapped[str] = mapped_column(String(64))
+    admin_id: Mapped[str] = mapped_column(
+        ForeignKey("admin_accounts.id", ondelete="CASCADE"),
+        index=True,
+    )
+    organization_id: Mapped[str | None] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        index=True,
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     __table_args__ = (
@@ -123,6 +171,37 @@ class AuditLog(Base):
     actor: Mapped[str] = mapped_column(String(128), index=True)
     action: Mapped[str] = mapped_column(String(64), index=True)
     details: Mapped[str] = mapped_column(Text, default="{}")
+    actor_admin_id: Mapped[str | None] = mapped_column(String(32))
+    request_id: Mapped[str | None] = mapped_column(String(64))
+    sequence: Mapped[int] = mapped_column(Integer)
+    previous_digest: Mapped[str] = mapped_column(String(64))
+    digest: Mapped[str] = mapped_column(String(64))
+
+
+class AuditChainState(Base):
+    __tablename__ = "audit_chain_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    digest: Mapped[str] = mapped_column(String(64))
+
+
+class SecurityIncident(Base):
+    __tablename__ = "security_incidents"
+    __table_args__ = (
+        Index("ix_security_incidents_org_updated", "organization_id", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
+    event_type: Mapped[str] = mapped_column(String(64))
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    event_count: Mapped[int] = mapped_column(Integer)
+    risk_score: Mapped[int] = mapped_column(Integer)
+    severity: Mapped[str] = mapped_column(String(16))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 SAFE_EVENT_METADATA = {
@@ -192,78 +271,6 @@ def initialize_organizations() -> None:
                     created_at=_now(),
                 ))
         db.commit()
-
-
-def initialize_admin_credentials() -> tuple[str, str] | None:
-    if settings.admin_username and settings.admin_password:
-        return None
-
-    import hashlib
-    import secrets
-    from sqlalchemy.exc import IntegrityError
-
-    username = "admin"
-    password = secrets.token_urlsafe(24)
-    salt = secrets.token_bytes(32)
-    password_hash = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=64)
-    try:
-        with SessionLocal() as db:
-            if db.get(AdminCredential, "primary") is not None:
-                return None
-            db.add(AdminCredential(
-                id="primary",
-                username=username,
-                password_salt=salt,
-                password_hash=password_hash,
-                created_at=_now(),
-            ))
-            db.commit()
-    except IntegrityError:
-        return None
-    return username, password
-
-
-def discard_admin_credentials(username: str, password: str) -> bool:
-    import hashlib
-
-    with SessionLocal() as db:
-        credential = db.get(AdminCredential, "primary")
-        if credential is None or credential.username != username:
-            return False
-        candidate = hashlib.scrypt(
-            password.encode(),
-            salt=credential.password_salt,
-            n=2**14,
-            r=8,
-            p=1,
-            dklen=64,
-        )
-        if not secrets.compare_digest(candidate, credential.password_hash):
-            return False
-        db.delete(credential)
-        db.commit()
-        return True
-
-
-def verify_stored_admin(username: str, password: str) -> bool:
-    import hashlib
-    import secrets
-
-    with SessionLocal() as db:
-        credential = db.get(AdminCredential, "primary")
-        if credential is None or not secrets.compare_digest(
-            username.encode(), credential.username.encode()
-        ):
-            return False
-        candidate = hashlib.scrypt(
-            password.encode(),
-            salt=credential.password_salt,
-            n=2**14,
-            r=8,
-            p=1,
-            dklen=64,
-        )
-        return secrets.compare_digest(candidate, credential.password_hash)
 
 
 def _now() -> datetime:
@@ -336,17 +343,112 @@ def record_audit(
     action: str,
     details: dict[str, Any] | None = None,
     organization_id: str | None = None,
+    actor_admin_id: str | None = None,
+    request_id: str | None = None,
 ) -> None:
-    with SessionLocal() as db:
+    details_json = json.dumps(details or {}, separators=(",", ":"), sort_keys=True)
+    with _audit_lock, SessionLocal() as db:
+        state = db.scalar(select(AuditChainState).where(AuditChainState.id == 1).with_for_update())
+        if state is None:
+            raise RuntimeError("Audit-chain state is unavailable.")
+        sequence = state.sequence + 1
+        previous_digest = state.digest
+        timestamp = _now()
+        entry_id = uuid.uuid4().hex
+        digest = _audit_digest(
+            entry_id,
+            sequence,
+            previous_digest,
+            organization_id or settings.organization_id,
+            actor_admin_id,
+            request_id,
+            timestamp,
+            actor,
+            action,
+            details_json,
+        )
         db.add(AuditLog(
-            id=uuid.uuid4().hex,
+            id=entry_id,
             organization_id=organization_id or settings.organization_id,
-            timestamp=_now(),
+            timestamp=timestamp,
             actor=actor,
             action=action,
-            details=json.dumps(details or {}, separators=(",", ":"), sort_keys=True),
+            details=details_json,
+            actor_admin_id=actor_admin_id,
+            request_id=request_id,
+            sequence=sequence,
+            previous_digest=previous_digest,
+            digest=digest,
         ))
+        state.sequence = sequence
+        state.digest = digest
         db.commit()
+
+
+def _audit_digest(
+    entry_id: str,
+    sequence: int,
+    previous_digest: str,
+    organization_id: str,
+    actor_admin_id: str | None,
+    request_id: str | None,
+    timestamp: datetime,
+    actor: str,
+    action: str,
+    details: str,
+) -> str:
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    else:
+        timestamp = timestamp.astimezone(timezone.utc)
+    payload = {
+        "id": entry_id,
+        "sequence": sequence,
+        "previous_digest": previous_digest,
+        "organization_id": organization_id,
+        "actor_admin_id": actor_admin_id,
+        "request_id": request_id,
+        "timestamp": timestamp.isoformat(),
+        "actor": actor,
+        "action": action,
+        "details": details,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    ).hexdigest()
+
+
+def verify_audit_chain() -> bool:
+    with SessionLocal() as db:
+        records = db.scalars(select(AuditLog).order_by(AuditLog.sequence)).all()
+        previous_digest = "0" * 64
+        for expected_sequence, record in enumerate(records, start=1):
+            if record.sequence != expected_sequence or record.previous_digest != previous_digest:
+                return False
+            timestamp = record.timestamp
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            expected_digest = _audit_digest(
+                record.id,
+                record.sequence,
+                record.previous_digest,
+                record.organization_id,
+                record.actor_admin_id,
+                record.request_id,
+                timestamp,
+                record.actor,
+                record.action,
+                record.details,
+            )
+            if not secrets.compare_digest(record.digest, expected_digest):
+                return False
+            previous_digest = record.digest
+        state = db.get(AuditChainState, 1)
+        return bool(
+            state
+            and state.sequence == len(records)
+            and secrets.compare_digest(state.digest, previous_digest)
+        )
 
 
 def _json_details(value: str) -> dict[str, Any]:
@@ -365,48 +467,6 @@ def _iso(value: datetime) -> str:
 
 def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
-
-
-def create_admin_session(username: str, organization_id: str | None = None) -> tuple[str, str]:
-    session_token = secrets.token_urlsafe(32)
-    csrf_token = secrets.token_urlsafe(32)
-    expires_at = _now() + timedelta(seconds=settings.admin_session_ttl_seconds)
-    with SessionLocal() as db:
-        db.query(AdminSession).where(AdminSession.expires_at <= _now()).delete(synchronize_session=False)
-        db.add(AdminSession(
-            token_hash=hashlib.sha256(session_token.encode()).hexdigest(),
-            csrf_hash=hashlib.sha256(csrf_token.encode()).hexdigest(),
-            organization_id=organization_id or settings.organization_id,
-            username=username,
-            expires_at=expires_at,
-        ))
-        db.commit()
-    return session_token, csrf_token
-
-
-def get_admin_session(session_token: str | None) -> tuple[str, str, str] | None:
-    if not session_token:
-        return None
-    token_hash = hashlib.sha256(session_token.encode()).hexdigest()
-    with SessionLocal() as db:
-        session = db.get(AdminSession, token_hash)
-        if session is None or _utc(session.expires_at) <= _now():
-            return None
-        return session.username, session.csrf_hash, session.organization_id
-
-
-def delete_admin_session(session_token: str | None) -> str | None:
-    if not session_token:
-        return None
-    token_hash = hashlib.sha256(session_token.encode()).hexdigest()
-    with SessionLocal() as db:
-        session = db.get(AdminSession, token_hash)
-        if session is None:
-            return None
-        username = session.username
-        db.delete(session)
-        db.commit()
-        return username
 
 
 def check_csrf(csrf_hash: str, csrf_token: str | None, csrf_cookie: str | None) -> bool:

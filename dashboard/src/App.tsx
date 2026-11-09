@@ -8,9 +8,21 @@ import {
 import {
   CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
-import { api, type AuditItem, type ClientItem, type EventItem, type Health, type Overview, type Point } from "./api";
+import {
+  api,
+  type AdminItem,
+  type AuditItem,
+  type ClientItem,
+  type EventItem,
+  type Health,
+  type IncidentItem,
+  type IntelligenceResult,
+  type OrganizationItem,
+  type Overview,
+  type Point,
+} from "./api";
 
-type View = "overview" | "clients" | "analytics" | "blocked" | "replays" | "suspicious" | "health" | "audit";
+type View = "overview" | "clients" | "analytics" | "blocked" | "replays" | "suspicious" | "health" | "audit" | "intelligence" | "users" | "organizations" | "password";
 type TimeRange = { label: string; hours: number };
 const ranges: TimeRange[] = [
   { label: "Last hour", hours: 1 },
@@ -18,15 +30,19 @@ const ranges: TimeRange[] = [
   { label: "7 days", hours: 168 },
   { label: "30 days", hours: 720 },
 ];
-const navigation: { id: View; label: string; icon: typeof LayoutDashboard; group: string }[] = [
-  { id: "overview", label: "Overview", icon: LayoutDashboard, group: "Monitor" },
-  { id: "clients", label: "Authenticated clients", icon: UsersRound, group: "Monitor" },
-  { id: "analytics", label: "Request analytics", icon: Activity, group: "Monitor" },
-  { id: "blocked", label: "Blocked requests", icon: ShieldAlert, group: "Security" },
-  { id: "replays", label: "Replay monitoring", icon: RotateCcw, group: "Security" },
-  { id: "suspicious", label: "Suspicious activity", icon: AlertTriangle, group: "Security" },
-  { id: "health", label: "System health", icon: Server, group: "System" },
-  { id: "audit", label: "Audit logs", icon: ScrollText, group: "System" },
+const navigation: { id: View; label: string; icon: typeof LayoutDashboard; group: string; permission: string }[] = [
+  { id: "overview", label: "Overview", icon: LayoutDashboard, group: "Monitor", permission: "dashboard.read" },
+  { id: "clients", label: "Authenticated clients", icon: UsersRound, group: "Monitor", permission: "dashboard.read" },
+  { id: "analytics", label: "Request analytics", icon: Activity, group: "Monitor", permission: "dashboard.read" },
+  { id: "blocked", label: "Blocked requests", icon: ShieldAlert, group: "Security", permission: "events.read" },
+  { id: "replays", label: "Replay monitoring", icon: RotateCcw, group: "Security", permission: "events.read" },
+  { id: "suspicious", label: "Suspicious activity", icon: AlertTriangle, group: "Security", permission: "events.read" },
+  { id: "intelligence", label: "Threat intelligence", icon: Activity, group: "Security", permission: "incidents.read" },
+  { id: "health", label: "System health", icon: Server, group: "System", permission: "health.read" },
+  { id: "audit", label: "Audit logs", icon: ScrollText, group: "System", permission: "audit.read" },
+  { id: "users", label: "Administrators", icon: UsersRound, group: "Administration", permission: "users.read" },
+  { id: "organizations", label: "Organizations", icon: Globe2, group: "Administration", permission: "organizations.manage" },
+  { id: "password", label: "Change password", icon: LockKeyhole, group: "Account", permission: "profile.password.change" },
 ];
 const titles: Record<View, { title: string; subtitle: string }> = {
   overview: { title: "Security overview", subtitle: "Live telemetry from your PostGuard gateway." },
@@ -37,6 +53,10 @@ const titles: Record<View, { title: string; subtitle: string }> = {
   suspicious: { title: "Suspicious activity", subtitle: "Authentication, policy, and advisory anomaly events." },
   health: { title: "System health", subtitle: "Current application dependencies and provider mode." },
   audit: { title: "Audit logs", subtitle: "Administrator authentication and security actions." },
+  intelligence: { title: "Threat intelligence", subtitle: "Deduplicated risk signals with optional AI-assisted defensive recommendations." },
+  users: { title: "Administrators", subtitle: "Manage organization-scoped administrator accounts and access." },
+  organizations: { title: "Organizations", subtitle: "Provision organizations and control service access." },
+  password: { title: "Change password", subtitle: "Update your administrator password and revoke existing sessions." },
 };
 
 function readCookie(name: string) {
@@ -61,6 +81,9 @@ function App() {
   const [authenticated, setAuthenticated] = useState(false);
   const [username, setUsername] = useState("");
   const [organizationId, setOrganizationId] = useState("");
+  const [role, setRole] = useState("");
+  const [permissions, setPermissions] = useState<string[]>([]);
+  const [mustChangePassword, setMustChangePassword] = useState(false);
   const [csrf, setCsrf] = useState("");
   const [checking, setChecking] = useState(true);
   const [active, setActive] = useState<View>("overview");
@@ -80,6 +103,11 @@ function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [admins, setAdmins] = useState<AdminItem[]>([]);
+  const [organizations, setOrganizations] = useState<OrganizationItem[]>([]);
+  const [incidents, setIncidents] = useState<IncidentItem[]>([]);
+  const [providerEnabled, setProviderEnabled] = useState(false);
+  const [investigation, setInvestigation] = useState<IntelligenceResult | null>(null);
 
   const load = useCallback(async (showSpinner = false) => {
     if (!authenticated) return;
@@ -118,6 +146,14 @@ function App() {
         setHealth(await api.health());
       } else if (active === "audit") {
         setAudit((await api.audit()).items);
+      } else if (active === "users") {
+        setAdmins((await api.users()).items);
+      } else if (active === "organizations") {
+        setOrganizations((await api.organizations()).items);
+      } else if (active === "intelligence") {
+        const result = await api.incidents();
+        setIncidents(result.items);
+        setProviderEnabled(result.provider_enabled);
       }
       setLastUpdated(new Date());
     } catch (reason) {
@@ -131,6 +167,9 @@ function App() {
     api.session().then((session) => {
       setUsername(session.username);
       setOrganizationId(session.organization_id);
+      setRole(session.role);
+      setPermissions(session.permissions);
+      setMustChangePassword(session.must_change_password);
       setAuthenticated(true);
       setCsrf(readCookie("postguard_admin_csrf"));
     }).catch(() => setAuthenticated(false)).finally(() => setChecking(false));
@@ -143,10 +182,13 @@ function App() {
     return () => window.clearInterval(timer);
   }, [authenticated, load]);
 
-  async function handleLogin(user: string, password: string) {
-    const result = await api.login(user, password);
+  async function handleLogin(user: string, password: string, requestedOrganizationId?: string) {
+    const result = await api.login(user, password, requestedOrganizationId);
     setUsername(result.username);
     setOrganizationId(result.organization_id);
+    setRole(result.role);
+    setPermissions(result.permissions);
+    setMustChangePassword(result.must_change_password);
     setCsrf(result.csrf_token);
     setAuthenticated(true);
     setActive("overview");
@@ -161,15 +203,28 @@ function App() {
       setAuthenticated(false);
       setUsername("");
       setOrganizationId("");
+      setRole("");
+      setPermissions([]);
+      setMustChangePassword(false);
       setCsrf("");
     }
   }
 
   const selected = titles[active];
-  const navGroups = useMemo(() => [...new Set(navigation.map((item) => item.group))], []);
+  const allowedNavigation = useMemo(
+    () => navigation.filter((item) => permissions.includes(item.permission)),
+    [permissions],
+  );
+  const navGroups = useMemo(() => [...new Set(allowedNavigation.map((item) => item.group))], [allowedNavigation]);
 
   if (checking) return <div className="loading-screen"><div className="loader" />Checking administrator session</div>;
   if (!authenticated) return <Login onLogin={handleLogin} />;
+  if (mustChangePassword) {
+    return <PasswordChange onSubmit={async (currentPassword, newPassword) => {
+      await api.changePassword(currentPassword, newPassword, csrf || readCookie("postguard_admin_csrf"));
+      await handleLogin(username, newPassword, organizationId);
+    }} forced />;
+  }
 
   return (
     <div className="app-shell">
@@ -188,7 +243,7 @@ function App() {
           {navGroups.map((group) => (
             <section className="nav-group" key={group}>
               <p>{group}</p>
-              {navigation.filter((item) => item.group === group).map(({ id, label, icon: Icon }) => (
+              {allowedNavigation.filter((item) => item.group === group).map(({ id, label, icon: Icon }) => (
                 <button key={id} className={`nav-item ${active === id ? "nav-active" : ""}`} onClick={() => { setActive(id); setMobileOpen(false); }}>
                   <Icon size={17} strokeWidth={1.9} /><span>{label}</span>
                   {id === "replays" && (overview?.replay_attacks ?? 0) > 0 && <span className="nav-count">{overview?.replay_attacks}</span>}
@@ -203,7 +258,7 @@ function App() {
           </div>
           <div className="sidebar-user">
             <div className="user-avatar">{username.slice(0, 1).toUpperCase() || "A"}</div>
-            <div><strong>{username}</strong><span>Administrator</span></div>
+            <div><strong>{username}</strong><span>{role.replaceAll("_", " ")}</span></div>
             <button className="icon-button" onClick={() => void handleLogout()} aria-label="Sign out"><LogOut size={16} /></button>
           </div>
         </div>
@@ -239,6 +294,24 @@ function App() {
           {active === "suspicious" && <EventsPage events={events} title="Suspicious events" description="Monitor failed authentication and policy signals without storing request secrets." />}
           {active === "health" && <HealthPage health={health} />}
           {active === "audit" && <AuditPage audit={audit} />}
+          {active === "intelligence" && <IntelligencePage incidents={incidents} providerEnabled={providerEnabled} result={investigation} onInvestigate={async () => {
+            try {
+              const result = await api.investigate(csrf || readCookie("postguard_admin_csrf"));
+              setInvestigation(result);
+            } catch (reason) {
+              setError(reason instanceof Error ? reason.message : "AI investigation failed.");
+            }
+          }} canInvestigate={permissions.includes("analyst.investigate")} />}
+          {active === "users" && <UsersPage admins={admins} canManage={permissions.includes("users.manage")} canAssignOwner={role === "platform_super_admin"} csrf={csrf} onRefresh={() => void load(true)} />}
+          {active === "organizations" && <OrganizationsPage organizations={organizations} csrf={csrf} onRefresh={() => void load(true)} />}
+          {active === "password" && <PasswordChange onSubmit={async (currentPassword, newPassword) => {
+            await api.changePassword(currentPassword, newPassword, csrf || readCookie("postguard_admin_csrf"));
+            setAuthenticated(false);
+            setUsername("");
+            setPermissions([]);
+            setRole("");
+            setCsrf("");
+          }} />}
           <footer className="page-footer"><span>PostGuard NG <b>·</b> Security Operations</span><span>Telemetry is persisted locally and is not mock activity.</span></footer>
         </div>
       </main>
@@ -370,7 +443,7 @@ function EventsTable({ events }: { events: EventItem[] }) {
 
 function HealthPage({ health }: { health: Health | null }) {
   const components = [
-    { title: "Deployment model", mode: health?.deployment_mode ?? "unknown", icon: Server, desc: health?.deployment_mode === "managed" ? "Managed mode selected; tenant membership and administration are not implemented" : "Customer-hosted deployment; this instance is operated by its owner" },
+    { title: "Deployment model", mode: health?.deployment_mode ?? "unknown", icon: Server, desc: health?.deployment_mode === "managed" ? "Managed label selected; hosting, client lifecycle, and a managed control plane remain operator responsibilities" : "Customer-hosted deployment; this instance is operated by its owner" },
     { title: "Application", status: health?.application ?? "unknown", icon: Gauge, desc: "FastAPI gateway request processing" },
     { title: "Telemetry database", status: health?.database ?? "unknown", icon: Database, desc: "Persistent dashboard events and audit history" },
     { title: "Redis security controls", status: health?.redis ?? "unknown", icon: Shield, desc: "Atomic rate limiting and nonce replay protection" },
@@ -396,9 +469,240 @@ function EmptyState({ title, detail }: { title: string; detail: string }) {
   return <div className="empty-state"><div><Search size={18} /></div><strong>{title}</strong><span>{detail}</span></div>;
 }
 
-function Login({ onLogin }: { onLogin: (username: string, password: string) => Promise<void> }) {
+function IntelligencePage({ incidents, providerEnabled, result, canInvestigate, onInvestigate }: {
+  incidents: IncidentItem[];
+  providerEnabled: boolean;
+  result: IntelligenceResult | null;
+  canInvestigate: boolean;
+  onInvestigate: () => Promise<void>;
+}) {
+  const [investigating, setInvestigating] = useState(false);
+  async function investigate() {
+    setInvestigating(true);
+    try {
+      await onInvestigate();
+    } finally {
+      setInvestigating(false);
+    }
+  }
+  return <>
+    <section className="panel data-panel">
+      <div className="panel-heading">
+        <div><h2>Deduplicated incident signals</h2><p>Events are grouped by type and UTC day; scores are deterministic triage aids, not proof of compromise.</p></div>
+        <span className="soft-pill">{incidents.length} active groups</span>
+      </div>
+      <div className="table-wrap">
+        <table><thead><tr><th>EVENT TYPE</th><th>SEVERITY</th><th>RISK SCORE</th><th>OCCURRENCES</th><th>FIRST SEEN</th><th>LAST SEEN</th></tr></thead>
+          <tbody>{incidents.map((incident) => <tr key={incident.id}>
+            <td><strong>{incident.event_type.replaceAll("_", " ")}</strong></td>
+            <td><span className={severityClass(incident.severity)}>{incident.severity}</span></td>
+            <td>{incident.risk_score}/100</td>
+            <td>{formatNumber(incident.event_count)}</td>
+            <td>{formatDate(incident.first_seen)}</td>
+            <td>{formatDate(incident.last_seen)}</td>
+          </tr>)}</tbody>
+        </table>
+        {incidents.length === 0 && <EmptyState title="No recent incidents" detail="Security events will be grouped here as the gateway records them." />}
+      </div>
+    </section>
+    <section className="panel data-panel" style={{ marginTop: 16 }}>
+      <div className="panel-heading">
+        <div><h2>AI-assisted investigation</h2><p>Optional OpenAI-compatible provider. Only aggregate event types, severities, scores, and counts are sent; identifiers and request metadata are excluded.</p></div>
+        <span className={`health-badge ${providerEnabled ? "healthy" : "degraded"}`}><i />{providerEnabled ? "Enabled" : "Disabled"}</span>
+      </div>
+      {providerEnabled ? <button className="button-secondary" disabled={!canInvestigate || investigating} onClick={() => void investigate()}>
+        {investigating ? "Investigating…" : "Generate defensive recommendations"}
+      </button> : <p className="intelligence-note">AI analysis is off. Enable and configure it on the server to use this feature.</p>}
+      {!canInvestigate && providerEnabled && <p className="intelligence-note">Your role can view incidents but cannot request AI investigations.</p>}
+      {result && <div className="incident-result">
+        <h3>Analyst summary</h3><p>{result.summary}</p>
+        <h3>Recommendations</h3>
+        {result.recommendations.length ? <ul>{result.recommendations.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul> : <p>No recommendations returned.</p>}
+        <p className="intelligence-note">Recommendations only. No automated actions were taken.</p>
+      </div>}
+    </section>
+  </>;
+}
+
+function UsersPage({ admins, canManage, canAssignOwner, csrf, onRefresh }: {
+  admins: AdminItem[];
+  canManage: boolean;
+  canAssignOwner: boolean;
+  csrf: string;
+  onRefresh: () => void;
+}) {
+  const [username, setUsername] = useState("");
+  const [newRole, setNewRole] = useState("read_only_operator");
+  const [temporaryPassword, setTemporaryPassword] = useState("");
+  const [error, setError] = useState("");
+  const csrfToken = csrf || readCookie("postguard_admin_csrf");
+  async function createUser(event: FormEvent) {
+    event.preventDefault();
+    setError("");
+    try {
+      const created = await api.createUser(username, newRole, csrfToken);
+      setTemporaryPassword(created.temporary_password);
+      setUsername("");
+      onRefresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not create administrator.");
+    }
+  }
+  async function updateUser(admin: AdminItem, changes: { role?: string; active?: boolean }) {
+    setError("");
+    try {
+      await api.updateUser(admin.admin_id, changes, csrfToken);
+      onRefresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not update administrator.");
+    }
+  }
+  async function resetPassword(admin: AdminItem) {
+    setError("");
+    try {
+      const result = await api.resetUserPassword(admin.admin_id, csrfToken);
+      setTemporaryPassword(`${admin.username}: ${result.temporary_password}`);
+      onRefresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not reset password.");
+    }
+  }
+  async function revokeSessions(admin: AdminItem) {
+    setError("");
+    try {
+      const result = await api.revokeUserSessions(admin.admin_id, csrfToken);
+      setTemporaryPassword(`${result.revoked_sessions} active session(s) revoked for ${admin.username}.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not revoke administrator sessions.");
+    }
+  }
+  return <section className="panel data-panel">
+    <div className="panel-heading"><div><h2>Organization administrators</h2><p>Temporary credentials are shown only once and must be changed at first sign-in.</p></div><span className="soft-pill">{admins.length} accounts</span></div>
+    {error && <div className="error-banner"><AlertTriangle size={15} /><span>{error}</span></div>}
+    {temporaryPassword && <div className="credential-notice"><strong>One-time password or access notice:</strong><code>{temporaryPassword}</code><button className="icon-button" onClick={() => setTemporaryPassword("")} aria-label="Dismiss administrator notice"><X size={15} /></button></div>}
+    {canManage && <form className="filters" onSubmit={createUser}>
+      <input required maxLength={128} value={username} onChange={(event) => setUsername(event.target.value)} placeholder="Administrator username" aria-label="Administrator username" />
+      <select value={newRole} onChange={(event) => setNewRole(event.target.value)} aria-label="New administrator role">
+        {canAssignOwner && <option value="organization_owner">Organization owner</option>}
+        <option value="organization_admin">Organization admin</option>
+        <option value="security_auditor">Security auditor</option>
+        <option value="read_only_operator">Read-only operator</option>
+      </select>
+      <button className="button-secondary">Create administrator</button>
+    </form>}
+    <div className="table-wrap"><table><thead><tr><th>USERNAME</th><th>ROLE</th><th>STATUS</th><th>PASSWORD</th>{canManage && <th>ACCESS</th>}</tr></thead>
+      <tbody>{admins.map((admin) => <tr key={admin.admin_id}>
+        <td><strong>{admin.username}</strong></td>
+        <td>{canManage ? <select aria-label={`Role for ${admin.username}`} value={admin.role} onChange={(event) => void updateUser(admin, { role: event.target.value })}>
+          <option value="organization_owner" disabled={!canAssignOwner}>Organization owner</option>
+          <option value="organization_admin">Organization admin</option>
+          <option value="security_auditor">Security auditor</option>
+          <option value="read_only_operator">Read-only operator</option>
+        </select> : admin.role.replaceAll("_", " ")}</td>
+        <td>{admin.active ? "Active" : "Disabled"}</td>
+        <td>{admin.must_change_password ? "Change required" : "Current"}</td>
+        {canManage && <td className="row-actions">
+          <button className="button-secondary" onClick={() => void updateUser(admin, { active: !admin.active })}>{admin.active ? "Disable" : "Enable"}</button>
+          <button className="button-secondary" onClick={() => void resetPassword(admin)}>Reset password</button>
+          <button className="button-secondary" onClick={() => void revokeSessions(admin)}>Revoke sessions</button>
+        </td>}
+      </tr>)}</tbody>
+    </table>{admins.length === 0 && <EmptyState title="No administrators" detail="Create an organization administrator to delegate access." />}</div>
+  </section>;
+}
+
+function OrganizationsPage({ organizations, csrf, onRefresh }: {
+  organizations: OrganizationItem[];
+  csrf: string;
+  onRefresh: () => void;
+}) {
+  const [organizationId, setOrganizationId] = useState("");
+  const [name, setName] = useState("");
+  const [error, setError] = useState("");
+  const csrfToken = csrf || readCookie("postguard_admin_csrf");
+  async function createOrganization(event: FormEvent) {
+    event.preventDefault();
+    setError("");
+    try {
+      await api.createOrganization(organizationId, name, csrfToken);
+      setOrganizationId("");
+      setName("");
+      onRefresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not create organization.");
+    }
+  }
+  async function setStatus(item: OrganizationItem) {
+    setError("");
+    try {
+      await api.setOrganizationStatus(item.organization_id, item.status === "active" ? "suspended" : "active", csrfToken);
+      onRefresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not update organization.");
+    }
+  }
+  return <section className="panel data-panel">
+    <div className="panel-heading"><div><h2>Organizations</h2><p>Suspended organizations cannot authenticate gateway requests or use tenant administration.</p></div><span className="soft-pill">{organizations.length} organizations</span></div>
+    {error && <div className="error-banner"><AlertTriangle size={15} /><span>{error}</span></div>}
+    <form className="filters" onSubmit={createOrganization}>
+      <input required maxLength={32} pattern="[A-Za-z0-9_-]+" value={organizationId} onChange={(event) => setOrganizationId(event.target.value)} placeholder="Organization ID" aria-label="Organization ID" />
+      <input required maxLength={128} value={name} onChange={(event) => setName(event.target.value)} placeholder="Organization name" aria-label="Organization name" />
+      <button className="button-secondary">Create organization</button>
+    </form>
+    <div className="table-wrap"><table><thead><tr><th>ORGANIZATION</th><th>STATUS</th><th>ACCESS CONTROL</th></tr></thead>
+      <tbody>{organizations.map((item) => <tr key={item.organization_id}>
+        <td><strong>{item.name}</strong><div className="intelligence-note">{item.organization_id}</div></td>
+        <td><span className={`status-label ${item.status === "active" ? "auth-active" : ""}`}>{item.status}</span></td>
+        <td><button className="button-secondary" onClick={() => void setStatus(item)}>{item.status === "active" ? "Suspend" : "Restore"}</button></td>
+      </tr>)}</tbody>
+    </table></div>
+  </section>;
+}
+
+function PasswordChange({ onSubmit, forced = false }: {
+  onSubmit: (currentPassword: string, newPassword: string) => Promise<void>;
+  forced?: boolean;
+}) {
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setError("");
+    if (newPassword !== confirmation) {
+      setError("New password confirmation does not match.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await onSubmit(currentPassword, newPassword);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not change password.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+  return <main className="login-page"><section className="login-card">
+    <div className="login-lock"><LockKeyhole size={20} /></div>
+    <div className="login-eyebrow">ACCOUNT SECURITY</div>
+    <h1>{forced ? "Set a new password" : "Change password"}</h1>
+    <p>{forced ? "Your temporary administrator password must be changed before continuing." : "Changing your password revokes all active sessions."}</p>
+    {error && <div className="login-error"><AlertTriangle size={15} />{error}</div>}
+    <form onSubmit={submit}>
+      <label>Current password<input autoComplete="current-password" type="password" required value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} /></label>
+      <label>New password<input autoComplete="new-password" type="password" minLength={16} maxLength={1024} required value={newPassword} onChange={(event) => setNewPassword(event.target.value)} /></label>
+      <label>Confirm new password<input autoComplete="new-password" type="password" minLength={16} maxLength={1024} required value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label>
+      <button className="login-submit" disabled={submitting}>{submitting ? "Updating password…" : "Update password"}</button>
+    </form>
+  </section></main>;
+}
+
+function Login({ onLogin }: { onLogin: (username: string, password: string, organizationId?: string) => Promise<void> }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [organizationId, setOrganizationId] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -407,7 +711,7 @@ function Login({ onLogin }: { onLogin: (username: string, password: string) => P
     setSubmitting(true);
     setError("");
     try {
-      await onLogin(username, password);
+      await onLogin(username, password, organizationId || undefined);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Sign-in failed.");
     } finally {
@@ -423,6 +727,7 @@ function Login({ onLogin }: { onLogin: (username: string, password: string) => P
       {error && <div className="login-error"><AlertTriangle size={15} />{error}</div>}
       <form onSubmit={submit}>
         <label>Administrator username<input autoComplete="username" required value={username} onChange={(event) => setUsername(event.target.value)} placeholder="Enter your username" /></label>
+        <label>Organization ID (if prompted)<input value={organizationId} onChange={(event) => setOrganizationId(event.target.value)} placeholder="Leave blank for default" /></label>
         <label>Password<div className="password-field"><input autoComplete="current-password" required type={showPassword ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Enter your password" /><button type="button" onClick={() => setShowPassword(!showPassword)} aria-label={showPassword ? "Hide password" : "Show password"}>{showPassword ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
         <button className="login-submit" disabled={submitting}>{submitting ? <><div className="button-loader" /> Verifying access</> : <>Sign in securely <ArrowUpRight size={17} /></>}</button>
       </form>

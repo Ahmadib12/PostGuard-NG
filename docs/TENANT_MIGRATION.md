@@ -14,7 +14,7 @@ The migration does not use a fixed `default` organization:
 
 Existing organization slugs must be unique, organization IDs must be valid, and existing tenant references must resolve. The migration fails without rewriting data when these checks do not pass. The follow-up validation migration blocks startup if an already-upgraded database contains rows whose ownership conflicts with the configured mapping or cannot be proven in a multi-organization configuration.
 
-Managed multi-tenancy remains unsupported. A successful migration does not provide tenant administration, membership/RBAC, or a managed control plane.
+Migrations `0005` and `0006` add administrator IAM, audit-chain integrity fields/state, and deduplicated security incident storage. Existing singleton administrator credentials are not automatically migrated or enabled for login. The audit-chain backfill normalizes legacy timestamps and refuses partially populated or inconsistent chains. Managed multi-tenancy remains unsupported: a successful migration does not provide tenant-specific client credentials/upstreams or a managed control plane.
 
 ## Upgrade and rollback
 

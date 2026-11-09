@@ -22,6 +22,7 @@ Edit `.env` before starting:
 
 - Set `TRUSTED_HOSTS` to the exact public hostname(s) accepted by the gateway (no wildcard).
 - Set `ADMIN_USERNAME` and `ADMIN_PASSWORD`; the password must be at least 16 characters. Use a separate administrator credential, never a client HMAC secret.
+- These values bootstrap the initial platform administrator only when the IAM store is empty. They do not reset existing IAM passwords or migrate a legacy singleton credential.
 - Replace every configured `POSTGUARD_*_SECRET` placeholder with a unique, random secret of at least 32 bytes.
 - Set `MOCK_NIPOST` explicitly. Keep it `true` unless an authorized live integration and credentials have been verified; for live mode set `NIPOST_API_KEY` and verify the upstream configuration.
 - Add `POSTGRES_PASSWORD` with a strong URL-safe value. For example, generate a 32-byte hexadecimal value with `openssl rand -hex 32`. It is used in the PostgreSQL URL and therefore must not contain URL-reserved characters.

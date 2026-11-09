@@ -25,18 +25,27 @@ import admin_api
 from app import app, _write_bootstrap_credentials
 from config import settings
 from dashboard_store import (
+    AdminAccount,
     AdminCredential,
+    AdminIAMSession,
     AdminSession,
     AuditLog,
+    AuditChainState,
+    OrganizationAdminMembership,
     Organization,
     RequestRecord,
     SecurityEvent,
+    SecurityIncident,
     SessionLocal,
-    initialize_admin_credentials,
+    initialize_database,
     overview,
+    record_audit,
     record_request,
     record_security_event,
+    verify_audit_chain,
 )
+from iam import create_admin_session, create_generated_platform_admin, set_organization_status
+from intelligence import investigate_incidents
 
 
 class DashboardAPITests(unittest.IsolatedAsyncioTestCase):
@@ -44,21 +53,47 @@ class DashboardAPITests(unittest.IsolatedAsyncioTestCase):
         object.__setattr__(settings, "admin_username", "operations-admin")
         object.__setattr__(settings, "admin_password", "Dashboard-Test-Password-95!")
         object.__setattr__(settings, "admin_cookie_secure", False)
-        admin_api._configured_password_salt = b"dashboard-unit-test-salt-32bytes"
-        admin_api._configured_password_hash = hashlib.scrypt(
-            settings.admin_password.encode(),
-            salt=admin_api._configured_password_salt,
-            n=2**14,
-            r=8,
-            p=1,
-        )
         admin_api._login_attempts.clear()
+        await asyncio.to_thread(initialize_database)
         with SessionLocal() as db:
             db.query(SecurityEvent).delete()
             db.query(RequestRecord).delete()
             db.query(AdminSession).delete()
+            db.query(AdminIAMSession).delete()
             db.query(AuditLog).delete()
+            db.query(OrganizationAdminMembership).delete()
+            db.query(AdminAccount).delete()
             db.query(AdminCredential).delete()
+            state = db.get(AuditChainState, 1)
+            state.sequence = 0
+            state.digest = "0" * 64
+            salt = b"dashboard-unit-test-salt-32bytes"
+            now = datetime.now(timezone.utc)
+            account = AdminAccount(
+                id="dashboard-test-admin",
+                username=settings.admin_username,
+                password_salt=salt,
+                password_hash=hashlib.scrypt(
+                    settings.admin_password.encode(),
+                    salt=salt,
+                    n=2**14,
+                    r=8,
+                    p=1,
+                    dklen=64,
+                ),
+                active=True,
+                platform_super_admin=False,
+                must_change_password=False,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(account)
+            db.add(OrganizationAdminMembership(
+                admin_id=account.id,
+                organization_id="default",
+                role="organization_owner",
+                created_at=now,
+            ))
             db.commit()
         self.lifespan = app.router.lifespan_context(app)
         await self.lifespan.__aenter__()
@@ -93,21 +128,52 @@ class DashboardAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(audit[0]["action"], "login")
         self.assertEqual(audit[0]["actor"], settings.admin_username)
 
-    async def test_first_start_generates_and_persists_unique_admin_credential(self):
-        object.__setattr__(settings, "admin_username", "")
-        object.__setattr__(settings, "admin_password", "")
-        credentials = await asyncio.to_thread(initialize_admin_credentials)
-        self.assertIsNotNone(credentials)
-        username, password = credentials
-        self.assertEqual(username, "admin")
-        self.assertGreaterEqual(len(password), 16)
-        self.assertTrue(admin_api._verify_admin(username, password))
+    async def test_first_start_generates_and_persists_platform_admin(self):
+        legacy_salt = b"legacy-singleton-salt-32bytes!!"
+        legacy_password = "Legacy-Old-Password-802!"
         with SessionLocal() as db:
-            stored = db.get(AdminCredential, "primary")
+            db.query(OrganizationAdminMembership).delete()
+            db.query(AdminAccount).delete()
+            db.add(AdminCredential(
+                id="primary",
+                username="legacy-admin",
+                password_salt=legacy_salt,
+                password_hash=hashlib.scrypt(
+                    legacy_password.encode(),
+                    salt=legacy_salt,
+                    n=2**14,
+                    r=8,
+                    p=1,
+                    dklen=64,
+                ),
+                created_at=datetime.now(timezone.utc),
+            ))
+            db.commit()
+        self.assertIsNone(await asyncio.to_thread(
+            create_admin_session,
+            "legacy-admin",
+            legacy_password,
+            "default",
+        ))
+        credentials = await asyncio.to_thread(create_generated_platform_admin)
+        self.assertIsNotNone(credentials)
+        admin_id, username, password = credentials
+        self.assertEqual(username, "platform-admin")
+        self.assertGreaterEqual(len(password), 16)
+        self.assertIsNotNone(await asyncio.to_thread(create_admin_session, username, password, "default"))
+        with SessionLocal() as db:
+            stored = db.get(AdminAccount, admin_id)
             self.assertNotIn(password.encode(), stored.password_hash)
-        self.assertIsNone(await asyncio.to_thread(initialize_admin_credentials))
+            self.assertIsNotNone(db.get(AdminCredential, "primary"))
+        self.assertIsNone(await asyncio.to_thread(create_generated_platform_admin))
 
     async def test_failed_bootstrap_file_write_removes_generated_admin_credential(self):
+        with SessionLocal() as db:
+            db.query(OrganizationAdminMembership).delete()
+            db.query(AdminAccount).delete()
+            db.commit()
+        original_username = settings.admin_username
+        original_password = settings.admin_password
         object.__setattr__(settings, "admin_username", "")
         object.__setattr__(settings, "admin_password", "")
         with patch("app._write_bootstrap_credentials", side_effect=OSError("read-only filesystem")):
@@ -115,9 +181,9 @@ class DashboardAPITests(unittest.IsolatedAsyncioTestCase):
                 async with app.router.lifespan_context(app):
                     self.fail("Application startup should fail when credentials cannot be persisted.")
         with SessionLocal() as db:
-            self.assertIsNone(db.get(AdminCredential, "primary"))
-        object.__setattr__(settings, "admin_username", "operations-admin")
-        object.__setattr__(settings, "admin_password", "Dashboard-Test-Password-95!")
+            self.assertEqual(db.query(AdminAccount).count(), 0)
+        object.__setattr__(settings, "admin_username", original_username)
+        object.__setattr__(settings, "admin_password", original_password)
 
     async def test_login_throttle_uses_forwarded_ip_only_for_configured_proxy(self):
         original_proxies = settings.trusted_proxies
@@ -293,6 +359,209 @@ class DashboardAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(suspicious.json()["total"], 1)
         self.assertNotIn("must-not-persist", suspicious.text)
         self.assertEqual(suspicious.json()["items"][0]["metadata"], {"region": "lagos"})
+
+    async def test_incidents_are_deduplicated_and_scoped_to_the_session_organization(self):
+        record_security_event("REPLAY_DETECTED", "replay-a", "demo-client", 409)
+        record_security_event("REPLAY_DETECTED", "replay-b", "demo-client", 409)
+        record_security_event("INVALID_SIGNATURE", "signature-a", "demo-client", 403)
+        record_security_event(
+            "UNKNOWN_CLIENT",
+            "other-org",
+            "partner-x",
+            401,
+            organization_id="tenant-b",
+        )
+        await self.login()
+
+        response = await self.client.get("/api/admin/intelligence/incidents")
+        self.assertEqual(response.status_code, 200, response.text)
+        items = response.json()["items"]
+        self.assertEqual({item["event_type"] for item in items}, {"REPLAY_DETECTED", "INVALID_SIGNATURE"})
+        replay = next(item for item in items if item["event_type"] == "REPLAY_DETECTED")
+        self.assertEqual(replay["event_count"], 2)
+        self.assertEqual(replay["risk_score"], 65)
+        self.assertEqual(len({item["id"] for item in items}), len(items))
+        with SessionLocal() as db:
+            self.assertEqual(db.query(SecurityIncident).filter_by(organization_id="default").count(), 2)
+        no_csrf = await self.client.post("/api/admin/intelligence/investigate")
+        self.assertEqual(no_csrf.status_code, 403)
+
+    async def test_ai_investigation_sends_only_aggregated_nonidentifying_context(self):
+        original = {
+            "enabled": settings.intelligence_enabled,
+            "base_url": settings.intelligence_base_url,
+            "api_key": settings.intelligence_api_key,
+            "model": settings.intelligence_model,
+        }
+        object.__setattr__(settings, "intelligence_enabled", True)
+        object.__setattr__(settings, "intelligence_base_url", "https://ai.example/v1")
+        object.__setattr__(settings, "intelligence_api_key", "test-provider-key")
+        object.__setattr__(settings, "intelligence_model", "test-model")
+        captured = {}
+        result_content = json.dumps({
+            "summary": "Repeated replay attempts should be reviewed.",
+            "recommendations": ["Review client credential use."],
+        })
+
+        def provider(request):
+            captured["url"] = str(request.url)
+            captured["body"] = request.content.decode()
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": result_content}}],
+            })
+
+        provider_client = httpx.AsyncClient(transport=httpx.MockTransport(provider))
+        try:
+            with patch("intelligence.httpx.AsyncClient", return_value=provider_client):
+                result = await investigate_incidents([{
+                    "event_type": "REPLAY_DETECTED",
+                    "severity": "high",
+                    "risk_score": 65,
+                    "event_count": 4,
+                    "client_id": "must-not-send",
+                    "request_id": "must-not-send-either",
+                }])
+        finally:
+            object.__setattr__(settings, "intelligence_enabled", original["enabled"])
+            object.__setattr__(settings, "intelligence_base_url", original["base_url"])
+            object.__setattr__(settings, "intelligence_api_key", original["api_key"])
+            object.__setattr__(settings, "intelligence_model", original["model"])
+        self.assertEqual(captured["url"], "https://ai.example/v1/chat/completions")
+        self.assertNotIn("must-not-send", captured["body"])
+        self.assertNotIn("request_id", captured["body"])
+        self.assertEqual(result["automated_actions"], False)
+        self.assertEqual(len(result["recommendations"]), 1)
+
+    async def test_audit_chain_detects_record_tampering(self):
+        record_audit("audit-test", "review", {"source": "unit-test"})
+        self.assertTrue(await asyncio.to_thread(verify_audit_chain))
+        with SessionLocal() as db:
+            entry = db.query(AuditLog).filter_by(action="review").one()
+            entry.details = '{"source":"changed"}'
+            db.commit()
+        self.assertFalse(await asyncio.to_thread(verify_audit_chain))
+
+    async def test_temporary_admin_password_flow_and_role_authorization(self):
+        owner_csrf = await self.login()
+        csrf_missing = await self.client.post(
+            "/api/admin/users",
+            json={"username": "auditor-user", "role": "security_auditor"},
+        )
+        self.assertEqual(csrf_missing.status_code, 403)
+        created = await self.client.post(
+            "/api/admin/users",
+            json={"username": "auditor-user", "role": "security_auditor"},
+            headers={"X-CSRF-Token": owner_csrf},
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        account = created.json()
+        self.assertTrue(account["must_change_password"])
+
+        auditor = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        )
+        try:
+            login = await auditor.post("/api/admin/login", json={
+                "username": account["username"],
+                "password": account["temporary_password"],
+            })
+            self.assertEqual(login.status_code, 200, login.text)
+            self.assertTrue(login.json()["must_change_password"])
+            self.assertEqual((await auditor.get("/api/admin/overview")).status_code, 403)
+            csrf = login.json()["csrf_token"]
+            changed = await auditor.post(
+                "/api/admin/password",
+                json={
+                    "current_password": account["temporary_password"],
+                    "new_password": "Auditor-New-Password-684!",
+                },
+                headers={"X-CSRF-Token": csrf},
+            )
+            self.assertEqual(changed.status_code, 200, changed.text)
+            relogin = await auditor.post("/api/admin/login", json={
+                "username": account["username"],
+                "password": "Auditor-New-Password-684!",
+            })
+            self.assertFalse(relogin.json()["must_change_password"])
+            self.assertEqual((await auditor.get("/api/admin/users")).status_code, 403)
+            self.assertEqual((await auditor.get("/api/admin/audit-logs")).status_code, 200)
+
+            revoked = await self.client.post(
+                f"/api/admin/users/{account['admin_id']}/revoke-sessions",
+                headers={"X-CSRF-Token": owner_csrf},
+            )
+            self.assertGreaterEqual(revoked.json()["revoked_sessions"], 1)
+            self.assertEqual((await auditor.get("/api/admin/session")).status_code, 401)
+            await auditor.post("/api/admin/login", json={
+                "username": account["username"],
+                "password": "Auditor-New-Password-684!",
+            })
+            reset = await self.client.post(
+                f"/api/admin/users/{account['admin_id']}/reset-password",
+                headers={"X-CSRF-Token": owner_csrf},
+            )
+            self.assertEqual(reset.status_code, 200, reset.text)
+            self.assertEqual((await auditor.get("/api/admin/session")).status_code, 401)
+        finally:
+            await auditor.aclose()
+
+    async def test_last_active_organization_owner_cannot_be_removed(self):
+        csrf = await self.login()
+        with SessionLocal() as db:
+            owner_id = db.query(AdminAccount).filter_by(username=settings.admin_username).one().id
+        response = await self.client.patch(
+            f"/api/admin/users/{owner_id}",
+            json={"active": False},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(response.status_code, 409)
+
+    async def test_suspended_organization_rejects_valid_gateway_authentication(self):
+        original_mappings = settings.client_organization_ids
+        object.__setattr__(settings, "client_organization_ids", {"demo-client": "tenant-b"})
+        with SessionLocal() as db:
+            if db.get(Organization, "tenant-b") is None:
+                db.add(Organization(
+                    id="tenant-b",
+                    slug="tenant-b",
+                    name="Tenant B",
+                    status="active",
+                    plan="standard",
+                    limits_json="{}",
+                    created_at=datetime.now(timezone.utc),
+                ))
+                db.commit()
+        await asyncio.to_thread(set_organization_status, "tenant-b", "suspended")
+        body = json.dumps({
+            "postcode": "FC-03-B06-AG-12",
+            "level": 1,
+            "client_lat": 9.0,
+            "client_lon": 7.0,
+            "declared_region": "Abuja",
+        }, separators=(",", ":")).encode()
+        timestamp = str(int(time.time()))
+        nonce = uuid.uuid4().hex
+        prefix = f"POST:/api/v1/secure-query:demo-client:{timestamp}:{nonce}:".encode()
+        signature = hmac.new(settings.client_secrets["demo-client"].encode(), prefix + body, hashlib.sha256).hexdigest()
+        try:
+            with patch("app.check_rate_limit_and_register_nonce", return_value="allowed"):
+                response = await self.client.post(
+                    "/api/v1/secure-query",
+                    content=body,
+                    headers={
+                        "X-Client-ID": "demo-client",
+                        "X-Timestamp": timestamp,
+                        "X-Nonce": nonce,
+                        "X-Signature": signature,
+                        "Content-Type": "application/json",
+                    },
+                )
+            self.assertEqual(response.status_code, 403)
+            self.assertIn("suspended", response.text.lower())
+        finally:
+            object.__setattr__(settings, "client_organization_ids", original_mappings)
+            await asyncio.to_thread(set_organization_status, "tenant-b", "active")
 
     async def test_event_pagination_filtering_and_date_validation(self):
         await self.login()
