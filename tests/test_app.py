@@ -11,6 +11,7 @@ from unittest.mock import patch
 os.environ["POSTGUARD_DEMO_CLIENT_SECRET"] = "test-demo-secret-" + ("d" * 32)
 os.environ["POSTGUARD_PARTNER_X_SECRET"] = "test-partner-secret-" + ("p" * 32)
 os.environ["MOCK_NIPOST"] = "true"
+os.environ["DASHBOARD_DATABASE_URL"] = "sqlite:///:memory:"
 
 import httpx
 from fastapi import status
@@ -160,6 +161,20 @@ class SecureQueryAPITests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+    async def test_non_json_secure_query_is_rejected(self):
+        body, headers = self.signed_request()
+        headers["Content-Type"] = "text/plain"
+        response = await self.client.post("/api/v1/secure-query", content=body, headers=headers)
+        self.assertEqual(response.status_code, status.HTTP_415_UNSUPPORTED_MEDIA_TYPE)
+
+    async def test_security_headers_and_request_id_are_present(self):
+        response = await self.client.get("/health")
+        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(response.headers["x-frame-options"], "DENY")
+        self.assertEqual(response.headers["referrer-policy"], "no-referrer")
+        self.assertEqual(response.headers["content-security-policy"], "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+        self.assertTrue(response.headers["x-request-id"])
 
     async def test_invalid_coordinates_are_rejected(self):
         body, headers = self.signed_request(payload={

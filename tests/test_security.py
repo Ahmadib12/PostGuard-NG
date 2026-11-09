@@ -10,16 +10,20 @@ from unittest.mock import AsyncMock, patch
 os.environ["POSTGUARD_DEMO_CLIENT_SECRET"] = "test-demo-secret-" + ("d" * 32)
 os.environ["POSTGUARD_PARTNER_X_SECRET"] = "test-partner-secret-" + ("p" * 32)
 os.environ["MOCK_NIPOST"] = "true"
+os.environ["DASHBOARD_DATABASE_URL"] = "sqlite:///:memory:"
 
 import redis
 import httpx
 from fastapi import HTTPException
 
 import security
-from config import _env_bool, settings
+from config import Settings, _env_bool, settings
 from security import (
     _RATE_LIMIT_SCRIPT,
+    _REGISTER_NONCE_SCRIPT,
     _REQUEST_CONTROLS_SCRIPT,
+    _client_key,
+    _nonce_key,
     check_rate_limit,
     check_rate_limit_and_register_nonce,
     detect_geo_anomaly,
@@ -68,14 +72,15 @@ class SecurityCoreTests(unittest.TestCase):
         signature = self.make_signature(body)
         self.assertFalse(verify_hmac_signature(body, "demo-client", str(int(time.time())), "bad!nonce", signature, "POST", "/api/v1/secure-query"))
 
-    @patch("security.redis_client.set", return_value=True)
-    def test_nonce_registration_is_atomic(self, set_nonce):
+    @patch("security.redis_client.eval", return_value=1)
+    def test_nonce_registration_checks_legacy_and_hashed_keys_atomically(self, eval_script):
         self.assertTrue(register_nonce("demo-client", "unique-nonce"))
-        set_nonce.assert_called_once_with(
+        eval_script.assert_called_once_with(
+            _REGISTER_NONCE_SCRIPT,
+            2,
+            f"postguard:v1:nonce:{_client_key('demo-client')}:{_nonce_key('unique-nonce')}",
             "postguard:nonce:demo-client:unique-nonce",
-            "1",
-            ex=settings.nonce_ttl_seconds,
-            nx=True,
+            settings.nonce_ttl_seconds,
         )
 
     @patch("security.redis_client.eval", return_value=11)
@@ -84,7 +89,7 @@ class SecurityCoreTests(unittest.TestCase):
         eval_script.assert_called_once_with(
             _RATE_LIMIT_SCRIPT,
             1,
-            "postguard:rate:demo-client",
+            f"postguard:v1:rate:{_client_key('demo-client')}",
             settings.rate_limit_window_seconds,
         )
 
@@ -99,8 +104,10 @@ class SecurityCoreTests(unittest.TestCase):
         self.assertEqual(check_rate_limit_and_register_nonce("demo-client", "unique-nonce"), "allowed")
         eval_script.assert_called_once_with(
             _REQUEST_CONTROLS_SCRIPT,
-            2,
+            4,
+            f"postguard:v1:rate:{_client_key('demo-client')}",
             "postguard:rate:demo-client",
+            f"postguard:v1:nonce:{_client_key('demo-client')}:{_nonce_key('unique-nonce')}",
             "postguard:nonce:demo-client:unique-nonce",
             settings.rate_limit_window_seconds,
             settings.client_policy["demo-client"]["rate_limit_per_minute"],
@@ -118,13 +125,19 @@ class SecurityCoreTests(unittest.TestCase):
             check_rate_limit_and_register_nonce("demo-client", "unique-nonce")
         self.assertEqual(raised.exception.status_code, 503)
 
-    @patch("security.redis_client.set", return_value=None)
-    def test_existing_nonce_is_rejected(self, set_nonce):
+    @patch("security.redis_client.eval", return_value=0)
+    def test_existing_nonce_is_rejected(self, eval_script):
         self.assertFalse(register_nonce("demo-client", "unique-nonce"))
-        set_nonce.assert_called_once()
+        eval_script.assert_called_once_with(
+            _REGISTER_NONCE_SCRIPT,
+            2,
+            f"postguard:v1:nonce:{_client_key('demo-client')}:{_nonce_key('unique-nonce')}",
+            "postguard:nonce:demo-client:unique-nonce",
+            settings.nonce_ttl_seconds,
+        )
 
-    @patch("security.redis_client.set", side_effect=redis.RedisError("unavailable"))
-    def test_nonce_registration_fails_closed_when_redis_is_unavailable(self, _set_nonce):
+    @patch("security.redis_client.eval", side_effect=redis.RedisError("unavailable"))
+    def test_nonce_registration_fails_closed_when_redis_is_unavailable(self, _eval_script):
         with self.assertRaises(HTTPException) as raised:
             register_nonce("demo-client", "unique-nonce")
         self.assertEqual(raised.exception.status_code, 503)
@@ -153,11 +166,53 @@ class SecurityCoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "TEST_BOOL must be one of"):
                 _env_bool("TEST_BOOL", False)
 
+    def test_mock_upstream_is_the_default(self):
+        self.assertTrue(Settings().mock_nipost)
+
+    def test_invalid_deployment_mode_fails_validation(self):
+        configured = Settings(deployment_mode="shared")
+        with self.assertRaisesRegex(RuntimeError, "POSTGUARD_DEPLOYMENT_MODE"):
+            configured.validate()
+
+    def test_customer_hosted_is_the_deployment_mode_default(self):
+        self.assertEqual(Settings().deployment_mode, "customer_hosted")
+
+    def test_managed_deployment_mode_is_an_explicit_valid_setting(self):
+        configured = Settings(deployment_mode="managed")
+        configured.validate()
+        self.assertEqual(configured.deployment_mode, "managed")
+
+    def test_client_organization_mapping_requires_configured_client_ids(self):
+        configured = Settings(client_organization_ids={"unknown-client": "tenant-a"})
+        with self.assertRaisesRegex(RuntimeError, "unknown client"):
+            configured.validate()
+
+    def test_live_upstream_rejects_private_ip_literals(self):
+        configured = Settings(
+            mock_nipost=False,
+            nipost_api_key="test-api-key",
+            nipost_base_url="https://127.0.0.1",
+        )
+        with self.assertRaisesRegex(RuntimeError, "private or non-public IP"):
+            configured.validate()
+
+    def test_production_requires_explicit_secure_settings(self):
+        configured = Settings(
+            app_environment="production",
+            admin_cookie_secure=False,
+            trusted_hosts=("gateway.example",),
+            admin_username="operations",
+            admin_password="a-strong-administrator-password",
+        )
+        with patch.dict(os.environ, {"MOCK_NIPOST": "true"}):
+            with self.assertRaisesRegex(RuntimeError, "ADMIN_COOKIE_SECURE"):
+                configured.validate()
+
     def test_proxy_to_nipost_handles_failed_connect(self):
         async def run():
             async with httpx.AsyncClient() as client:
                 with patch.object(security, "settings", security.settings.__class__(mock_nipost=False, nipost_api_key="abc", nipost_base_url="https://api.postcode.gov.ng")):
-                    with patch.object(client, "get", new_callable=AsyncMock, side_effect=httpx.ConnectError("down")):
+                    with patch.object(client, "send", new_callable=AsyncMock, side_effect=httpx.ConnectError("down")):
                         return await proxy_to_nipost("FC-03-B06-AG-12", 1, client)
 
         self.assertEqual(asyncio.run(run())["status"], "UPSTREAM_ERROR")
@@ -166,7 +221,7 @@ class SecurityCoreTests(unittest.TestCase):
         async def run():
             async with httpx.AsyncClient() as client:
                 with patch.object(security, "settings", security.settings.__class__(mock_nipost=False, nipost_api_key="abc", nipost_base_url="https://api.postcode.gov.ng")):
-                    with patch.object(client, "get", new_callable=AsyncMock, side_effect=httpx.TimeoutException("timeout")):
+                    with patch.object(client, "send", new_callable=AsyncMock, side_effect=httpx.TimeoutException("timeout")):
                         return await proxy_to_nipost("FC-03-B06-AG-12", 1, client)
 
         self.assertEqual(asyncio.run(run())["status"], "UPSTREAM_ERROR")
@@ -191,6 +246,57 @@ class SecurityCoreTests(unittest.TestCase):
         self.assertEqual(non_object_result["status"], "UPSTREAM_ERROR")
         self.assertEqual(redirect_result["status"], "UPSTREAM_ERROR")
 
+    def test_proxy_rejects_responses_over_configured_limit(self):
+        async def run():
+            transport = httpx.MockTransport(
+                lambda _request: httpx.Response(200, content=b'{"large":"' + b"x" * 64 + b'"}')
+            )
+            async with httpx.AsyncClient(transport=transport) as client:
+                configured_settings = security.settings.__class__(
+                    mock_nipost=False,
+                    nipost_api_key="abc",
+                    nipost_base_url="https://api.postcode.gov.ng",
+                    max_upstream_response_bytes=32,
+                )
+                with patch.object(security, "settings", configured_settings):
+                    return await proxy_to_nipost("FC-03-B06-AG-12", 1, client)
+
+        self.assertEqual(asyncio.run(run())["status"], "UPSTREAM_ERROR")
+
+    def test_proxy_handles_upstream_read_errors(self):
+        class FailingStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b'{"partial":'
+                raise httpx.ReadError("upstream connection interrupted")
+
+            async def aclose(self):
+                return None
+
+        async def run():
+            transport = httpx.MockTransport(
+                lambda _request: httpx.Response(200, stream=FailingStream())
+            )
+            async with httpx.AsyncClient(transport=transport) as client:
+                configured_settings = security.settings.__class__(
+                    mock_nipost=False,
+                    nipost_api_key="abc",
+                    nipost_base_url="https://api.postcode.gov.ng",
+                )
+                with patch.object(security, "settings", configured_settings):
+                    return await proxy_to_nipost("FC-03-B06-AG-12", 1, client)
+
+        result = asyncio.run(run())
+        self.assertEqual(result["status"], "UPSTREAM_ERROR")
+        self.assertEqual(result["status_code"], 502)
+
+    def test_redis_key_material_does_not_expose_client_or_nonce(self):
+        client_key = _client_key("demo-client")
+        nonce_key = _nonce_key("unique-nonce")
+        self.assertNotIn("demo-client", client_key)
+        self.assertNotIn("unique-nonce", nonce_key)
+        self.assertEqual(len(client_key), 64)
+        self.assertEqual(len(nonce_key), 64)
+
 
 @unittest.skipUnless(
     os.getenv("RUN_REDIS_INTEGRATION_TESTS") == "1",
@@ -204,9 +310,13 @@ class RedisConcurrencyIntegrationTests(unittest.TestCase):
             self.skipTest(f"Redis is unavailable: {exc}")
 
         unique_id = f"integration-{os.getpid()}-{time.time_ns()}"
-        nonce_key = f"postguard:nonce:{unique_id}:same-nonce-value"
-        limited_nonce_key = f"postguard:nonce:{unique_id}:limited-nonce-value"
-        rate_key = f"postguard:rate:{unique_id}"
+        client_key = _client_key(unique_id)
+        nonce_key = f"postguard:v1:nonce:{client_key}:{_nonce_key('same-nonce-value')}"
+        limited_nonce_key = f"postguard:v1:nonce:{client_key}:{_nonce_key('limited-nonce-value')}"
+        rate_key = f"postguard:v1:rate:{client_key}"
+        legacy_nonce_key = f"postguard:nonce:{unique_id}:same-nonce-value"
+        legacy_limited_nonce_key = f"postguard:nonce:{unique_id}:limited-nonce-value"
+        legacy_rate_key = f"postguard:rate:{unique_id}"
         try:
             with ThreadPoolExecutor(max_workers=32) as pool:
                 results = list(pool.map(
@@ -220,9 +330,12 @@ class RedisConcurrencyIntegrationTests(unittest.TestCase):
                 check_rate_limit_and_register_nonce(unique_id, "limited-nonce-value"),
                 "rate_limited",
             )
-            self.assertFalse(redis_client.exists(limited_nonce_key))
+            self.assertFalse(redis_client.exists(limited_nonce_key, legacy_limited_nonce_key))
         finally:
-            redis_client.delete(nonce_key, limited_nonce_key, rate_key)
+            redis_client.delete(
+                nonce_key, limited_nonce_key, rate_key, legacy_nonce_key,
+                legacy_limited_nonce_key, legacy_rate_key,
+            )
 
 
 if __name__ == "__main__":

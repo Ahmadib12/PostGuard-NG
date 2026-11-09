@@ -36,6 +36,7 @@ export type Health = {
   application: string;
   redis: string;
   database: string;
+  deployment_mode: "customer_hosted" | "managed";
   upstream: string;
   upstream_is_mock: boolean;
 };
@@ -58,9 +59,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  session: () => request<{ authenticated: boolean; username: string }>("/api/admin/session"),
+  session: () => request<{ authenticated: boolean; username: string; organization_id: string }>("/api/admin/session"),
   login: (username: string, password: string) =>
-    request<{ username: string; csrf_token: string }>("/api/admin/login", {
+    request<{ username: string; organization_id: string; csrf_token: string }>("/api/admin/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password }),

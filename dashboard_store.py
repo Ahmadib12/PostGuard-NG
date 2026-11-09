@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, LargeBinary, String, Text, case, create_engine, func, inspect, select, text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, LargeBinary, String, Text, case, create_engine, func, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from config import settings
@@ -41,11 +41,27 @@ class Base(DeclarativeBase):
     pass
 
 
-class RequestRecord(Base):
-    __tablename__ = "request_records"
-    __table_args__ = (Index("ix_request_timestamp_client", "timestamp", "client_id"),)
+class Organization(Base):
+    __tablename__ = "organizations"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    slug: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(16), default="active")
+    plan: Mapped[str] = mapped_column(String(32), default="development")
+    limits_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: _now())
+
+
+class RequestRecord(Base):
+    __tablename__ = "request_records"
+    __table_args__ = (
+        Index("ix_request_timestamp_client", "timestamp", "client_id"),
+        Index("ix_request_org_timestamp", "organization_id", "timestamp"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), default="default", index=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     client_id: Mapped[str | None] = mapped_column(String(128), index=True)
     status_code: Mapped[int] = mapped_column(Integer)
@@ -59,9 +75,11 @@ class SecurityEvent(Base):
     __table_args__ = (
         Index("ix_security_timestamp_type", "timestamp", "event_type"),
         Index("ix_security_client_timestamp", "client_id", "timestamp"),
+        Index("ix_security_org_timestamp", "organization_id", "timestamp"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), default="default", index=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     event_type: Mapped[str] = mapped_column(String(64), index=True)
     client_id: Mapped[str | None] = mapped_column(String(128), index=True)
@@ -77,6 +95,7 @@ class AdminSession(Base):
 
     token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     csrf_hash: Mapped[str] = mapped_column(String(64))
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), default="default", index=True)
     username: Mapped[str] = mapped_column(String(128), index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
@@ -93,9 +112,13 @@ class AdminCredential(Base):
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
-    __table_args__ = (Index("ix_audit_timestamp_action", "timestamp", "action"),)
+    __table_args__ = (
+        Index("ix_audit_timestamp_action", "timestamp", "action"),
+        Index("ix_audit_org_timestamp", "organization_id", "timestamp"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), default="default", index=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     actor: Mapped[str] = mapped_column(String(128), index=True)
     action: Mapped[str] = mapped_column(String(64), index=True)
@@ -141,13 +164,34 @@ def initialize_database() -> None:
             with engine.connect() as connection:
                 applied = connection.execute(text("SELECT version_num FROM alembic_version")).scalars().all()
             if not applied and existing_tables.intersection(Base.metadata.tables):
-                Base.metadata.create_all(engine)
-                for table in Base.metadata.tables.values():
-                    for index in table.indexes:
-                        index.create(engine, checkfirst=True)
-                command.stamp(migration_config, "head")
-                return
+                legacy_tables = [
+                    table for table in Base.metadata.sorted_tables
+                    if table.name != "organizations"
+                ]
+                Base.metadata.create_all(engine, tables=legacy_tables)
+                command.stamp(migration_config, "0002_generated_admin_credential")
         command.upgrade(migration_config, "head")
+
+
+def initialize_organizations() -> None:
+    organization_ids = {
+        "default",
+        settings.organization_id,
+        *settings.client_organization_ids.values(),
+    }
+    with SessionLocal() as db:
+        for organization_id in organization_ids:
+            if db.get(Organization, organization_id) is None:
+                db.add(Organization(
+                    id=organization_id,
+                    slug=organization_id,
+                    name=organization_id,
+                    status="active",
+                    plan="development",
+                    limits_json="{}",
+                    created_at=_now(),
+                ))
+        db.commit()
 
 
 def initialize_admin_credentials() -> tuple[str, str] | None:
@@ -179,6 +223,28 @@ def initialize_admin_credentials() -> tuple[str, str] | None:
     return username, password
 
 
+def discard_admin_credentials(username: str, password: str) -> bool:
+    import hashlib
+
+    with SessionLocal() as db:
+        credential = db.get(AdminCredential, "primary")
+        if credential is None or credential.username != username:
+            return False
+        candidate = hashlib.scrypt(
+            password.encode(),
+            salt=credential.password_salt,
+            n=2**14,
+            r=8,
+            p=1,
+            dklen=64,
+        )
+        if not secrets.compare_digest(candidate, credential.password_hash):
+            return False
+        db.delete(credential)
+        db.commit()
+        return True
+
+
 def verify_stored_admin(username: str, password: str) -> bool:
     import hashlib
     import secrets
@@ -204,16 +270,26 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def organization_for_client(client_id: str | None) -> str:
+    if not client_id:
+        return settings.organization_id
+    return settings.client_organization_ids.get(client_id, settings.organization_id)
+
+
 def record_request(
     request_id: str,
     client_id: str | None,
     status_code: int,
     duration_ms: int,
     authenticated: bool,
+    organization_id: str | None = None,
 ) -> None:
     with SessionLocal() as db:
         db.add(RequestRecord(
             id=request_id,
+            organization_id=organization_id or (
+                organization_for_client(client_id) if authenticated else settings.organization_id
+            ),
             timestamp=_now(),
             client_id=client_id,
             status_code=status_code,
@@ -231,6 +307,7 @@ def record_security_event(
     http_status: int | None = None,
     outcome: str | None = None,
     severity: str | None = None,
+    organization_id: str | None = None,
     **metadata: Any,
 ) -> None:
     safe_metadata = {
@@ -241,6 +318,7 @@ def record_security_event(
     with SessionLocal() as db:
         db.add(SecurityEvent(
             id=uuid.uuid4().hex,
+            organization_id=organization_id or organization_for_client(client_id),
             timestamp=_now(),
             event_type=event_type,
             client_id=client_id,
@@ -253,10 +331,16 @@ def record_security_event(
         db.commit()
 
 
-def record_audit(actor: str, action: str, details: dict[str, Any] | None = None) -> None:
+def record_audit(
+    actor: str,
+    action: str,
+    details: dict[str, Any] | None = None,
+    organization_id: str | None = None,
+) -> None:
     with SessionLocal() as db:
         db.add(AuditLog(
             id=uuid.uuid4().hex,
+            organization_id=organization_id or settings.organization_id,
             timestamp=_now(),
             actor=actor,
             action=action,
@@ -283,7 +367,7 @@ def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
-def create_admin_session(username: str) -> tuple[str, str]:
+def create_admin_session(username: str, organization_id: str | None = None) -> tuple[str, str]:
     session_token = secrets.token_urlsafe(32)
     csrf_token = secrets.token_urlsafe(32)
     expires_at = _now() + timedelta(seconds=settings.admin_session_ttl_seconds)
@@ -292,6 +376,7 @@ def create_admin_session(username: str) -> tuple[str, str]:
         db.add(AdminSession(
             token_hash=hashlib.sha256(session_token.encode()).hexdigest(),
             csrf_hash=hashlib.sha256(csrf_token.encode()).hexdigest(),
+            organization_id=organization_id or settings.organization_id,
             username=username,
             expires_at=expires_at,
         ))
@@ -299,7 +384,7 @@ def create_admin_session(username: str) -> tuple[str, str]:
     return session_token, csrf_token
 
 
-def get_admin_session(session_token: str | None) -> tuple[str, str] | None:
+def get_admin_session(session_token: str | None) -> tuple[str, str, str] | None:
     if not session_token:
         return None
     token_hash = hashlib.sha256(session_token.encode()).hexdigest()
@@ -307,7 +392,7 @@ def get_admin_session(session_token: str | None) -> tuple[str, str] | None:
         session = db.get(AdminSession, token_hash)
         if session is None or _utc(session.expires_at) <= _now():
             return None
-        return session.username, session.csrf_hash
+        return session.username, session.csrf_hash, session.organization_id
 
 
 def delete_admin_session(session_token: str | None) -> str | None:
@@ -339,11 +424,14 @@ def _apply_since(query, model, since: datetime | None):
     return query.where(model.timestamp >= since) if since else query
 
 
-def overview(hours: int = 24) -> dict[str, Any]:
+def overview(hours: int = 24, organization_id: str | None = None) -> dict[str, Any]:
+    organization_id = organization_id or settings.organization_id
     since = _range_start(hours)
     with SessionLocal() as db:
-        requests = _apply_since(select(RequestRecord), RequestRecord, since).subquery()
-        events = _apply_since(select(SecurityEvent), SecurityEvent, since).subquery()
+        requests_query = select(RequestRecord).where(RequestRecord.organization_id == organization_id)
+        events_query = select(SecurityEvent).where(SecurityEvent.organization_id == organization_id)
+        requests = _apply_since(requests_query, RequestRecord, since).subquery()
+        events = _apply_since(events_query, SecurityEvent, since).subquery()
         total, successful, failed = db.execute(select(
             func.count(requests.c.id),
             func.sum(case((requests.c.outcome == "success", 1), else_=0)),
@@ -358,6 +446,7 @@ def overview(hours: int = 24) -> dict[str, Any]:
         client_count = db.scalar(
             select(func.count(func.distinct(RequestRecord.client_id))).where(
                 RequestRecord.authenticated.is_(True),
+                RequestRecord.organization_id == organization_id,
                 *([RequestRecord.timestamp >= since] if since else []),
             )
         ) or 0
@@ -388,10 +477,12 @@ def _time_bucket(ts: datetime, hours: int) -> str:
     return ts.strftime("%Y-%m-%dT00:00:00Z")
 
 
-def analytics(hours: int = 24) -> dict[str, Any]:
+def analytics(hours: int = 24, organization_id: str | None = None) -> dict[str, Any]:
+    organization_id = organization_id or settings.organization_id
     since = _range_start(hours)
     with SessionLocal() as db:
-        rows = db.scalars(_apply_since(select(RequestRecord).order_by(RequestRecord.timestamp), RequestRecord, since)).all()
+        query = select(RequestRecord).where(RequestRecord.organization_id == organization_id)
+        rows = db.scalars(_apply_since(query.order_by(RequestRecord.timestamp), RequestRecord, since)).all()
         buckets: dict[str, dict[str, int]] = {}
         for row in rows:
             key = _time_bucket(row.timestamp, hours)
@@ -402,7 +493,8 @@ def analytics(hours: int = 24) -> dict[str, Any]:
         return {"range_hours": hours, "points": [{"timestamp": key, **value} for key, value in sorted(buckets.items())]}
 
 
-def clients_activity() -> list[dict[str, Any]]:
+def clients_activity(organization_id: str | None = None) -> list[dict[str, Any]]:
+    organization_id = organization_id or settings.organization_id
     now = _now()
     with SessionLocal() as db:
         rows = db.execute(select(
@@ -413,7 +505,10 @@ def clients_activity() -> list[dict[str, Any]]:
             func.max(RequestRecord.timestamp),
             func.sum(case((RequestRecord.authenticated.is_(True), 1), else_=0)),
             func.max(case((RequestRecord.authenticated.is_(True), RequestRecord.timestamp), else_=None)),
-        ).where(RequestRecord.client_id.is_not(None)).group_by(RequestRecord.client_id)).all()
+        ).where(
+            RequestRecord.client_id.is_not(None),
+            RequestRecord.organization_id == organization_id,
+        ).group_by(RequestRecord.client_id)).all()
     by_id = {
         row[0]: {
             "client_id": row[0],
@@ -427,6 +522,8 @@ def clients_activity() -> list[dict[str, Any]]:
         for row in rows
     }
     for client_id, policy in settings.client_policy.items():
+        if organization_for_client(client_id) != organization_id:
+            continue
         by_id.setdefault(client_id, {
             "client_id": client_id,
             "total_requests": 0,
@@ -437,7 +534,11 @@ def clients_activity() -> list[dict[str, Any]]:
             "authenticated_recently": False,
         })
         by_id[client_id]["enabled"] = bool(policy)
-    return [by_id[client_id] for client_id in settings.client_policy]
+    return [
+        by_id[client_id]
+        for client_id in settings.client_policy
+        if organization_for_client(client_id) == organization_id
+    ]
 
 
 def list_events(
@@ -449,8 +550,11 @@ def list_events(
     since: datetime | None = None,
     until: datetime | None = None,
     event_types: tuple[str, ...] | None = None,
+    organization_id: str | None = None,
 ) -> dict[str, Any]:
-    query = select(SecurityEvent)
+    query = select(SecurityEvent).where(
+        SecurityEvent.organization_id == (organization_id or settings.organization_id)
+    )
     if event_type:
         query = query.where(SecurityEvent.event_type == event_type)
     if client_id:
@@ -484,10 +588,12 @@ def list_events(
         }
 
 
-def list_audit_logs(page: int, page_size: int) -> dict[str, Any]:
+def list_audit_logs(page: int, page_size: int, organization_id: str | None = None) -> dict[str, Any]:
+    organization_id = organization_id or settings.organization_id
     with SessionLocal() as db:
-        total = db.scalar(select(func.count()).select_from(AuditLog)) or 0
-        rows = db.scalars(select(AuditLog).order_by(AuditLog.timestamp.desc()).offset((page - 1) * page_size).limit(page_size)).all()
+        query = select(AuditLog).where(AuditLog.organization_id == organization_id)
+        total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+        rows = db.scalars(query.order_by(AuditLog.timestamp.desc()).offset((page - 1) * page_size).limit(page_size)).all()
         return {
             "items": [{
                 "id": row.id,

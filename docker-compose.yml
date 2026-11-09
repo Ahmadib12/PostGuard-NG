@@ -1,0 +1,109 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      APP_ENV: production
+      DEBUG: "false"
+      POSTGUARD_DEPLOYMENT_MODE: customer_hosted
+      ADMIN_COOKIE_SECURE: "true"
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:?Set TRUSTED_HOSTS in .env to your public hostname}
+      TRUSTED_PROXIES: 172.30.0.2
+      MOCK_NIPOST: ${MOCK_NIPOST:?Set MOCK_NIPOST explicitly in .env}
+      REDIS_URL: redis://redis:6379/0
+      DASHBOARD_DATABASE_URL: postgresql+psycopg://postguard:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/postguard
+    ports:
+      - "${POSTGUARD_BIND_ADDRESS:-127.0.0.1}:${POSTGUARD_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,os,urllib.request; h=os.environ['TRUSTED_HOSTS'].split(',')[0].strip(); r=urllib.request.Request('http://127.0.0.1:8000/health',headers={'Host':h}); d=json.load(urllib.request.urlopen(r,timeout=3)); raise SystemExit(0 if d['readiness']['ready'] else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_BIND_ADDRESS:-127.0.0.1}:${DASHBOARD_PORT:-8080}:8080"
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      default:
+        ipv4_address: 172.30.0.2
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: postguard
+      POSTGRES_USER: postguard
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postguard -d postguard"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

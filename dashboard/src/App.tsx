@@ -60,6 +60,7 @@ function severityClass(value: string) {
 function App() {
   const [authenticated, setAuthenticated] = useState(false);
   const [username, setUsername] = useState("");
+  const [organizationId, setOrganizationId] = useState("");
   const [csrf, setCsrf] = useState("");
   const [checking, setChecking] = useState(true);
   const [active, setActive] = useState<View>("overview");
@@ -129,6 +130,7 @@ function App() {
   useEffect(() => {
     api.session().then((session) => {
       setUsername(session.username);
+      setOrganizationId(session.organization_id);
       setAuthenticated(true);
       setCsrf(readCookie("postguard_admin_csrf"));
     }).catch(() => setAuthenticated(false)).finally(() => setChecking(false));
@@ -144,6 +146,7 @@ function App() {
   async function handleLogin(user: string, password: string) {
     const result = await api.login(user, password);
     setUsername(result.username);
+    setOrganizationId(result.organization_id);
     setCsrf(result.csrf_token);
     setAuthenticated(true);
     setActive("overview");
@@ -157,6 +160,7 @@ function App() {
     } finally {
       setAuthenticated(false);
       setUsername("");
+      setOrganizationId("");
       setCsrf("");
     }
   }
@@ -178,8 +182,7 @@ function App() {
         </div>
         <div className="workspace-picker">
           <div className="workspace-avatar">PG</div>
-          <div><strong>Gateway environment</strong><span>Production workspace</span></div>
-          <ChevronDown size={15} />
+          <div><strong>Organization</strong><span>{organizationId}</span></div>
         </div>
         <nav className="nav-list" aria-label="Dashboard navigation">
           {navGroups.map((group) => (
@@ -367,6 +370,7 @@ function EventsTable({ events }: { events: EventItem[] }) {
 
 function HealthPage({ health }: { health: Health | null }) {
   const components = [
+    { title: "Deployment model", mode: health?.deployment_mode ?? "unknown", icon: Server, desc: health?.deployment_mode === "managed" ? "Managed mode selected; tenant membership and administration are not implemented" : "Customer-hosted deployment; this instance is operated by its owner" },
     { title: "Application", status: health?.application ?? "unknown", icon: Gauge, desc: "FastAPI gateway request processing" },
     { title: "Telemetry database", status: health?.database ?? "unknown", icon: Database, desc: "Persistent dashboard events and audit history" },
     { title: "Redis security controls", status: health?.redis ?? "unknown", icon: Shield, desc: "Atomic rate limiting and nonce replay protection" },
@@ -374,7 +378,7 @@ function HealthPage({ health }: { health: Health | null }) {
   ];
   return <>
     <div className={`health-hero ${health?.status === "healthy" ? "" : "health-hero-degraded"}`}><div className="health-hero-icon"><Shield size={24} /></div><div><span>OVERALL SYSTEM STATUS</span><h2>{health?.status === "healthy" ? "All monitored systems operational" : "One or more systems need attention"}</h2><p>Health checks reflect the latest API probe; upstream live connectivity is not continuously tested.</p></div><span className="health-badge">{health?.status ?? "checking"}</span></div>
-    <div className="component-grid">{components.map(({ title, status, icon: Icon, desc }) => <div className="panel component-card" key={title}><div className="component-card-top"><div className="metric-icon tone-blue"><Icon size={18} /></div><span className={`service-state ${(status === "ok" || status === "mock_mode") ? "state-ok" : "state-warn"}`}><i />{status.replaceAll("_", " ")}</span></div><h3>{title}</h3><p>{desc}</p></div>)}</div>
+    <div className="component-grid">{components.map(({ title, status, mode, icon: Icon, desc }) => <div className="panel component-card" key={title}><div className="component-card-top"><div className="metric-icon tone-blue"><Icon size={18} /></div>{mode ? <span className="audit-action">{mode.replaceAll("_", " ")}</span> : <span className={`service-state ${(status === "ok" || status === "mock_mode") ? "state-ok" : "state-warn"}`}><i />{(status ?? "unknown").replaceAll("_", " ")}</span>}</div><h3>{title}</h3><p>{desc}</p></div>)}</div>
     <div className="notice-card"><AlertTriangle size={18} /><div><strong>Provider mode disclosure</strong><p>Mock mode is explicitly labeled and never represented as verified NIPOST data. A live provider status is not checked by the health endpoint.</p></div></div>
   </>;
 }

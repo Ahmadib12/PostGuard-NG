@@ -3,26 +3,32 @@ import hashlib
 import hmac
 import json
 import os
+import stat
+import tempfile
 import time
 import unittest
 import uuid
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 os.environ["POSTGUARD_DEMO_CLIENT_SECRET"] = "dashboard-test-client-" + ("d" * 32)
 os.environ["POSTGUARD_PARTNER_X_SECRET"] = "dashboard-test-partner-" + ("p" * 32)
 os.environ["MOCK_NIPOST"] = "true"
+os.environ["DASHBOARD_DATABASE_URL"] = "sqlite:///:memory:"
 
 import httpx
 from fastapi import status
+from starlette.requests import Request
 from sqlalchemy.exc import SQLAlchemyError
 
 import admin_api
-from app import app
+from app import app, _write_bootstrap_credentials
 from config import settings
 from dashboard_store import (
     AdminCredential,
     AdminSession,
     AuditLog,
+    Organization,
     RequestRecord,
     SecurityEvent,
     SessionLocal,
@@ -79,6 +85,7 @@ class DashboardAPITests(unittest.IsolatedAsyncioTestCase):
             json={"username": settings.admin_username, "password": settings.admin_password},
         )
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["organization_id"], "default")
         self.assertNotIn(settings.admin_password, response.text)
         self.assertIn("httponly", response.headers["set-cookie"].lower())
         self.assertIn("samesite=strict", response.headers["set-cookie"].lower())
@@ -99,6 +106,55 @@ class DashboardAPITests(unittest.IsolatedAsyncioTestCase):
             stored = db.get(AdminCredential, "primary")
             self.assertNotIn(password.encode(), stored.password_hash)
         self.assertIsNone(await asyncio.to_thread(initialize_admin_credentials))
+
+    async def test_failed_bootstrap_file_write_removes_generated_admin_credential(self):
+        object.__setattr__(settings, "admin_username", "")
+        object.__setattr__(settings, "admin_password", "")
+        with patch("app._write_bootstrap_credentials", side_effect=OSError("read-only filesystem")):
+            with self.assertRaisesRegex(OSError, "read-only filesystem"):
+                async with app.router.lifespan_context(app):
+                    self.fail("Application startup should fail when credentials cannot be persisted.")
+        with SessionLocal() as db:
+            self.assertIsNone(db.get(AdminCredential, "primary"))
+        object.__setattr__(settings, "admin_username", "operations-admin")
+        object.__setattr__(settings, "admin_password", "Dashboard-Test-Password-95!")
+
+    async def test_login_throttle_uses_forwarded_ip_only_for_configured_proxy(self):
+        original_proxies = settings.trusted_proxies
+        object.__setattr__(settings, "trusted_proxies", ("172.30.0.0/24",))
+        try:
+            def request_from(peer, forwarded):
+                scope = {
+                    "type": "http",
+                    "http_version": "1.1",
+                    "method": "POST",
+                    "scheme": "http",
+                    "path": "/api/admin/login",
+                    "raw_path": b"/api/admin/login",
+                    "query_string": b"",
+                    "headers": [(b"x-real-ip", forwarded.encode())],
+                    "client": (peer, 12345),
+                    "server": ("app", 8000),
+                }
+                return admin_api._remote_address(Request(scope))
+
+            self.assertEqual(request_from("172.30.0.2", "198.51.100.10"), "198.51.100.10")
+            self.assertEqual(request_from("172.30.0.2", "not-an-ip"), "172.30.0.2")
+            self.assertEqual(request_from("192.0.2.10", "198.51.100.10"), "192.0.2.10")
+        finally:
+            object.__setattr__(settings, "trusted_proxies", original_proxies)
+
+    async def test_bootstrap_credentials_use_a_private_file_and_do_not_overwrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "initial-admin.env")
+            _write_bootstrap_credentials("admin", "one-time-test-password", path)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            with open(path, encoding="utf-8") as credential_file:
+                content = credential_file.read()
+            self.assertIn("ADMIN_USERNAME=admin", content)
+            self.assertIn("ADMIN_PASSWORD=one-time-test-password", content)
+            with self.assertRaises(FileExistsError):
+                _write_bootstrap_credentials("admin", "replacement", path)
 
     async def test_invalid_admin_credentials_are_rejected_and_audited(self):
         response = await self.client.post(
@@ -155,6 +211,33 @@ class DashboardAPITests(unittest.IsolatedAsyncioTestCase):
         chart = await self.client.get("/api/admin/analytics?hours=1")
         self.assertEqual(sum(point["total"] for point in chart.json()["points"]), 3)
         self.assertEqual(sum(point["successful"] for point in chart.json()["points"]), 1)
+
+    async def test_dashboard_queries_are_scoped_to_the_session_organization(self):
+        with SessionLocal() as db:
+            db.add(Organization(
+                id="tenant-b",
+                slug="tenant-b",
+                name="Tenant B",
+                status="active",
+                plan="development",
+                limits_json="{}",
+                created_at=datetime.now(timezone.utc),
+            ))
+            db.commit()
+        record_request("other-tenant-request", "demo-client", 200, 1, True, "tenant-b")
+        record_security_event(
+            "REPLAY_DETECTED",
+            "other-tenant-event",
+            "demo-client",
+            409,
+            organization_id="tenant-b",
+        )
+        await self.login()
+
+        overview_response = await self.client.get("/api/admin/overview")
+        events_response = await self.client.get("/api/admin/events")
+        self.assertEqual(overview_response.json()["total_requests"], 0)
+        self.assertEqual(events_response.json()["total"], 0)
 
     async def test_secure_gateway_requests_feed_dashboard_metrics(self):
         await self.login()
@@ -256,6 +339,7 @@ class DashboardAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["database"], "ok")
         self.assertEqual(response.json()["upstream"], "mock_mode")
         self.assertTrue(response.json()["upstream_is_mock"])
+        self.assertEqual(response.json()["deployment_mode"], "customer_hosted")
 
     async def test_failed_telemetry_does_not_change_security_enforcement(self):
         body = b'{"postcode":"FC-03-B06-AG-12","level":1,"client_lat":9,"client_lon":7,"declared_region":"Abuja"}'

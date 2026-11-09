@@ -92,15 +92,20 @@ Important: the current implementation is mock-first. The app supports mock mode 
 
 ## Environment variables
 
+`POSTGUARD_DEPLOYMENT_MODE` selects `customer_hosted` (default) or `managed`. Tenant ownership columns, server-side client-to-organization configuration, and organization-scoped telemetry/session queries provide an initial isolation foundation. This is not a complete managed multi-tenant service: tenant membership/RBAC, tenant provisioning, per-tenant credentials/upstreams, and platform administration are not implemented. Do not share one installation across mutually untrusted organizations. See [docs/DEPLOYMENT_MODES.md](./docs/DEPLOYMENT_MODES.md) for the implementation status.
+
 Create a local `.env` from `.env.example`, replace placeholders, and keep secrets out of source control. Configure a separate administrator username and password; client HMAC credentials are never administrator credentials.
 
 Relevant configuration:
 
 ```bash
-HOST=0.0.0.0
+HOST=127.0.0.1
 PORT=8000
+APP_ENV=development
 DEBUG=false
 MOCK_NIPOST=true
+TRUSTED_HOSTS=localhost,127.0.0.1
+MAX_UPSTREAM_RESPONSE_BYTES=1048576
 REDIS_URL=redis://localhost:6379/0
 DASHBOARD_DATABASE_URL=sqlite:///./postguard_dashboard.db
 ADMIN_USERNAME=admin
@@ -114,7 +119,9 @@ POSTGUARD_PARTNER_X_SECRET=replace-me-with-a-different-32-byte-secret
 NIPOST_API_KEY=live-key-only-when-not-using-mock-mode
 ```
 
-`ADMIN_PASSWORD` must contain at least 16 characters. The example disables the Secure cookie flag only for local HTTP development; set `ADMIN_COOKIE_SECURE=true` behind HTTPS in every deployed environment. When both admin variables are blank, the first backend startup generates a unique `admin` password, stores only its salted scrypt hash, and prints the password once in the backend terminal. Save it securely. To rotate or replace it, configure `ADMIN_USERNAME` and `ADMIN_PASSWORD` in `.env` and restart. The database stores only password hashes and hashed random session/CSRF tokens.
+`ADMIN_PASSWORD` must contain at least 16 characters. The example disables the Secure cookie flag only for local HTTP development; set `ADMIN_COOKIE_SECURE=true` behind HTTPS in every deployed environment. When both admin variables are blank, the first backend startup generates a unique `admin` password and stores only its salted scrypt hash in the database. The one-time bootstrap credentials are written to `ADMIN_BOOTSTRAP_FILE` (default `.admin-bootstrap-credential`) with owner-only permissions, not to application logs. Read and securely store them, configure `ADMIN_USERNAME` and `ADMIN_PASSWORD` in `.env`, restart, and then remove the bootstrap file securely. The database stores only password hashes and hashed random session/CSRF tokens.
+
+Mock upstream mode defaults to enabled when `MOCK_NIPOST` is omitted. For production, set `APP_ENV=production`, `DEBUG=false`, `MOCK_NIPOST` explicitly, `ADMIN_COOKIE_SECURE=true`, and `TRUSTED_HOSTS` to a comma-separated list of the exact hostnames serving the application. Production startup rejects wildcard/empty trusted hosts, missing administrator credentials, and insecure live upstream URLs. API documentation routes are disabled in production. Configure TLS at the trusted ingress and serve the dashboard and API from the same origin; do not rely on the Vite development server for deployment.
 
 SQLite is the default local telemetry database. For PostgreSQL, set a SQLAlchemy URL such as:
 
@@ -149,7 +156,7 @@ redis-server
 ## Run the application
 
 ```bash
-uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 The API and dashboard backend are available on port 8000. The backend applies the telemetry schema migration during startup.
@@ -166,7 +173,13 @@ npm run dev
 
 Open the Vite URL (normally `http://localhost:5173`). The development server proxies `/api` requests to `http://127.0.0.1:8000`. Set the administrator variables in the root `.env` before signing in. For a production frontend build, run `npm run build` in `dashboard/`; serve `dashboard/dist/` behind the same-origin reverse proxy as the backend API. Do not expose the admin API through an untrusted cross-origin setup.
 
+The backend sends restrictive security headers, disables caching on administrator API responses, validates JSON content type for secure queries, and echoes an opaque request ID in `X-Request-ID`. The live upstream response body is capped by `MAX_UPSTREAM_RESPONSE_BYTES` (default 1 MiB); redirects are disabled and ambient proxy environment variables are ignored. Configure outbound network policy at the deployment boundary so the backend can reach only the intended upstream; DNS/private-network egress policy remains an infrastructure responsibility.
+
 The UI polls the active dashboard view every 30 seconds; manually refresh with the top-bar refresh button. Available views include request overview/analytics, configured client activity, blocked requests, replay reports, suspicious events, dependency health, and admin audit history.
+
+The System health view shows the selected deployment mode. `POSTGUARD_ORGANIZATION_ID` binds the configured administrator session; `POSTGUARD_CLIENT_ORGANIZATIONS` can map authenticated clients to organizations for telemetry. These settings provide limited telemetry/session scoping, not tenant membership, RBAC, per-tenant upstream/client management, or a full tenant isolation boundary. Do not use `managed` to host multiple mutually untrusted organizations.
+
+For a single customer-hosted Docker deployment, see [docs/CUSTOMER_HOSTED_DEPLOYMENT.md](./docs/CUSTOMER_HOSTED_DEPLOYMENT.md). It serves the built dashboard on port 8080 and the API on port 8000, both loopback-bound by default. See [docs/DEPLOYMENT_MODES.md](./docs/DEPLOYMENT_MODES.md), [docs/MANAGED_DEPLOYMENT.md](./docs/MANAGED_DEPLOYMENT.md), [docs/MULTI_TENANT_SECURITY.md](./docs/MULTI_TENANT_SECURITY.md), [docs/TENANT_ISOLATION.md](./docs/TENANT_ISOLATION.md), and [docs/OPERATIONS.md](./docs/OPERATIONS.md) for mode status and operational boundaries.
 
 ## Run tests
 
@@ -181,6 +194,10 @@ Optional Redis integration tests can be enabled with:
 ```bash
 RUN_REDIS_INTEGRATION_TESTS=1 python -m unittest discover -s tests -v
 ```
+
+`npm audit --audit-level=high` checks the dashboard dependency tree. CI also runs Python tests, the production dashboard build, Bandit, and pip-audit.
+
+See [SECURITY.md](./SECURITY.md) for implemented controls, deployment hardening, incident response, and limitations.
 
 ## Sample client
 

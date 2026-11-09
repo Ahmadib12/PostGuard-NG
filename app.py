@@ -1,19 +1,29 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from admin_api import router as admin_router
 from config import settings
-from dashboard_store import initialize_admin_credentials, initialize_database, record_request, record_security_event
+from dashboard_store import (
+    initialize_admin_credentials,
+    initialize_database,
+    initialize_organizations,
+    discard_admin_credentials,
+    record_request,
+    record_security_event,
+)
 from security import (
     check_rate_limit_and_register_nonce,
     detect_geo_anomaly,
@@ -28,6 +38,22 @@ from security import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("PostGuard-NG")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def _write_bootstrap_credentials(username: str, password: str, destination: str | Path) -> Path:
+    path = Path(destination)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as credential_file:
+            credential_file.write(f"ADMIN_USERNAME={username}\nADMIN_PASSWORD={password}\n")
+            credential_file.flush()
+            os.fsync(credential_file.fileno())
+    except OSError:
+        path.unlink(missing_ok=True)
+        raise
+    return path
 
 
 async def emit_event(
@@ -63,17 +89,33 @@ async def emit_event(
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     await asyncio.to_thread(initialize_database)
+    await asyncio.to_thread(initialize_organizations)
     generated_admin = await asyncio.to_thread(initialize_admin_credentials)
     if generated_admin:
+        try:
+            credential_file = await asyncio.to_thread(
+                _write_bootstrap_credentials,
+                generated_admin[0],
+                generated_admin[1],
+                settings.admin_bootstrap_file,
+            )
+        except OSError:
+            await asyncio.to_thread(
+                discard_admin_credentials,
+                generated_admin[0],
+                generated_admin[1],
+            )
+            raise
         logger.warning(
             "Initial administrator credentials (shown once): username=%s password=%s. "
-            "Set ADMIN_USERNAME and ADMIN_PASSWORD in the local environment to replace them.",
+            "Bootstrap credentials were written to %s with owner-only permissions; configure the environment and remove the file.",
             generated_admin[0],
-            generated_admin[1],
+            credential_file,
         )
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(10.0, connect=3.0),
         follow_redirects=False,
+        trust_env=False,
     ) as client:
         application.state.http_client = client
         yield
@@ -83,9 +125,15 @@ app = FastAPI(
     title=settings.app_name,
     description="Security gateway for signed postcode lookup requests.",
     version=settings.app_version,
+    debug=settings.debug,
+    docs_url="/docs" if settings.app_environment == "development" else None,
+    redoc_url="/redoc" if settings.app_environment == "development" else None,
+    openapi_url="/openapi.json" if settings.app_environment == "development" else None,
     lifespan=lifespan,
 )
 app.include_router(admin_router)
+if settings.trusted_hosts:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.trusted_hosts))
 
 
 _CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -117,6 +165,16 @@ class RequestBodyLimitMiddleware:
                 return
             if declared_length > self.max_body_bytes:
                 response = JSONResponse({"detail": "Request body too large."}, status_code=413)
+                await response(scope, receive, send)
+                return
+
+        if scope.get("path") == "/api/v1/secure-query" and scope.get("method") == "POST":
+            content_type = headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower()
+            if content_type != b"application/json":
+                response = JSONResponse(
+                    {"detail": "Content-Type must be application/json."},
+                    status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                )
                 await response(scope, receive, send)
                 return
 
@@ -158,9 +216,8 @@ class RequestTelemetryMiddleware:
             await self.application(scope, receive, send)
             return
 
-        request_id = uuid.uuid4().hex
         state = scope.setdefault("state", {})
-        state["request_id"] = request_id
+        request_id = state.setdefault("request_id", uuid.uuid4().hex)
         started = asyncio.get_running_loop().time()
         status_code = 500
 
@@ -190,8 +247,47 @@ class RequestTelemetryMiddleware:
                 logger.exception("Could not persist request telemetry; request security enforcement remains active.")
 
 
+class SecurityHeadersMiddleware:
+    def __init__(self, app):
+        self.application = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.application(scope, receive, send)
+            return
+
+        state = scope.setdefault("state", {})
+        request_id = state.setdefault("request_id", uuid.uuid4().hex)
+        path = scope.get("path", "")
+
+        async def add_security_headers(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers.extend([
+                    (b"x-content-type-options", b"nosniff"),
+                    (b"x-frame-options", b"DENY"),
+                    (b"referrer-policy", b"no-referrer"),
+                    (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
+                    (b"x-request-id", request_id.encode("ascii")),
+                ])
+                if path.startswith("/api/admin/"):
+                    headers.append((b"cache-control", b"no-store"))
+                if path not in {"/docs", "/redoc", "/openapi.json"}:
+                    headers.append((
+                        b"content-security-policy",
+                        b"default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+                    ))
+                if scope.get("scheme") == "https":
+                    headers.append((b"strict-transport-security", b"max-age=31536000; includeSubDomains"))
+                message["headers"] = headers
+            await send(message)
+
+        await self.application(scope, receive, add_security_headers)
+
+
 app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=settings.max_request_body_bytes)
 app.add_middleware(RequestTelemetryMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
 
 
 class PostcodeQuery(BaseModel):
@@ -267,6 +363,13 @@ async def secure_postcode_query(
     x_signature: str = Header(..., alias="X-Signature"),
 ):
     request_id = request.state.request_id
+
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Content-Type must be application/json.",
+        )
 
     if not re.fullmatch(r"^[A-Za-z0-9._-]+$", x_client_id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed client ID.")
