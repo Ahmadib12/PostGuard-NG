@@ -17,7 +17,8 @@ os.environ["MOCK_NIPOST"] = "true"
 os.environ["DASHBOARD_DATABASE_URL"] = "sqlite:///:memory:"
 
 import httpx
-from fastapi import status
+import redis
+from fastapi import HTTPException, status
 from starlette.requests import Request
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -185,6 +186,30 @@ class DashboardAPITests(unittest.IsolatedAsyncioTestCase):
         object.__setattr__(settings, "admin_username", original_username)
         object.__setattr__(settings, "admin_password", original_password)
 
+    def test_admin_login_rate_limit_uses_atomic_redis_script(self):
+        ip_address = "203.0.113.8"
+        expected_key = f"postguard:v1:admin-login:{hashlib.sha256(ip_address.encode('utf-8')).hexdigest()}"
+        with patch("admin_api.redis_client.eval", return_value=1) as mock_eval:
+            self.assertTrue(admin_api._permit_login(ip_address))
+        mock_eval.assert_called_once_with(
+            admin_api._LOGIN_RATE_LIMIT_SCRIPT,
+            1,
+            expected_key,
+            settings.admin_login_window_seconds,
+            settings.admin_login_attempts,
+        )
+
+    def test_admin_login_rate_limit_fails_closed_in_production(self):
+        original_environment = settings.app_environment
+        object.__setattr__(settings, "app_environment", "production")
+        try:
+            with patch("admin_api.redis_client.eval", side_effect=redis.RedisError("down")):
+                with self.assertRaises(HTTPException) as raised:
+                    admin_api._permit_login("203.0.113.9")
+            self.assertEqual(raised.exception.status_code, 503)
+        finally:
+            object.__setattr__(settings, "app_environment", original_environment)
+
     async def test_login_throttle_uses_forwarded_ip_only_for_configured_proxy(self):
         original_proxies = settings.trusted_proxies
         object.__setattr__(settings, "trusted_proxies", ("172.30.0.0/24",))
@@ -200,8 +225,7 @@ class DashboardAPITests(unittest.IsolatedAsyncioTestCase):
                     "query_string": b"",
                     "headers": [(b"x-real-ip", forwarded.encode())],
                     "client": (peer, 12345),
-                    "server": ("app", 8000),
-                }
+                    "server": ("app", 8000),                }
                 return admin_api._remote_address(Request(scope))
 
             self.assertEqual(request_from("172.30.0.2", "198.51.100.10"), "198.51.100.10")
