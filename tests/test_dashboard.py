@@ -186,18 +186,37 @@ class DashboardAPITests(unittest.IsolatedAsyncioTestCase):
         object.__setattr__(settings, "admin_username", original_username)
         object.__setattr__(settings, "admin_password", original_password)
 
-    def test_admin_login_rate_limit_uses_atomic_redis_script(self):
+    def test_successful_redis_login_rate_checks_do_not_use_local_storage(self):
         ip_address = "203.0.113.8"
         expected_key = f"postguard:v1:admin-login:{hashlib.sha256(ip_address.encode('utf-8')).hexdigest()}"
-        with patch("admin_api.redis_client.eval", return_value=1) as mock_eval:
-            self.assertTrue(admin_api._permit_login(ip_address))
-        mock_eval.assert_called_once_with(
-            admin_api._LOGIN_RATE_LIMIT_SCRIPT,
-            1,
-            expected_key,
-            settings.admin_login_window_seconds,
-            settings.admin_login_attempts,
-        )
+        original_environment = settings.app_environment
+        object.__setattr__(settings, "app_environment", "production")
+        try:
+            with patch("admin_api.redis_client.eval", return_value=1) as mock_eval:
+                self.assertTrue(admin_api._permit_login(ip_address))
+            mock_eval.assert_called_once_with(
+                admin_api._LOGIN_RATE_LIMIT_SCRIPT,
+                1,
+                expected_key,
+                settings.admin_login_window_seconds,
+                settings.admin_login_attempts,
+            )
+            self.assertNotIn(ip_address, admin_api._login_attempts)
+        finally:
+            object.__setattr__(settings, "app_environment", original_environment)
+
+    def test_redis_rate_limit_rejects_excess_attempts_without_local_storage(self):
+        ip_address = "203.0.113.10"
+        original_environment = settings.app_environment
+        object.__setattr__(settings, "app_environment", "production")
+        try:
+            with patch("admin_api.redis_client.eval", side_effect=[1, 0]) as mock_eval:
+                self.assertTrue(admin_api._permit_login(ip_address))
+                self.assertFalse(admin_api._permit_login(ip_address))
+            self.assertEqual(mock_eval.call_count, 2)
+            self.assertNotIn(ip_address, admin_api._login_attempts)
+        finally:
+            object.__setattr__(settings, "app_environment", original_environment)
 
     def test_admin_login_rate_limit_fails_closed_in_production(self):
         original_environment = settings.app_environment
@@ -207,6 +226,45 @@ class DashboardAPITests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(HTTPException) as raised:
                     admin_api._permit_login("203.0.113.9")
             self.assertEqual(raised.exception.status_code, 503)
+            self.assertNotIn("203.0.113.9", admin_api._login_attempts)
+        finally:
+            object.__setattr__(settings, "app_environment", original_environment)
+
+    def test_development_login_rate_limit_uses_local_fallback(self):
+        ip_address = "203.0.113.11"
+        original_environment = settings.app_environment
+        object.__setattr__(settings, "app_environment", "development")
+        try:
+            with patch("admin_api.redis_client.eval", side_effect=redis.RedisError("should not be called")) as mock_eval:
+                for _ in range(settings.admin_login_attempts):
+                    self.assertTrue(admin_api._permit_login(ip_address))
+                self.assertFalse(admin_api._permit_login(ip_address))
+            mock_eval.assert_not_called()
+            self.assertEqual(len(admin_api._login_attempts[ip_address]), settings.admin_login_attempts)
+        finally:
+            object.__setattr__(settings, "app_environment", original_environment)
+
+    def test_development_login_rate_limit_cleans_expired_entries(self):
+        original_environment = settings.app_environment
+        object.__setattr__(settings, "app_environment", "development")
+        try:
+            expired_ip = "203.0.113.12"
+            admin_api._login_attempts[expired_ip] = [
+                time.monotonic() - settings.admin_login_window_seconds - 1
+            ]
+            self.assertTrue(admin_api._permit_login("203.0.113.13"))
+            self.assertNotIn(expired_ip, admin_api._login_attempts)
+        finally:
+            object.__setattr__(settings, "app_environment", original_environment)
+
+    def test_development_login_fallback_bounds_unique_ip_storage(self):
+        original_environment = settings.app_environment
+        object.__setattr__(settings, "app_environment", "development")
+        try:
+            with patch.object(admin_api, "_MAX_LOCAL_LOGIN_IPS", 32):
+                for index in range(128):
+                    self.assertTrue(admin_api._permit_login(f"198.51.100.{index}"))
+                self.assertEqual(len(admin_api._login_attempts), 32)
         finally:
             object.__setattr__(settings, "app_environment", original_environment)
 

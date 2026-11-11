@@ -53,6 +53,7 @@ SESSION_COOKIE = "postguard_admin"
 CSRF_COOKIE = "postguard_admin_csrf"
 _login_attempts: dict[str, list[float]] = {}
 _login_attempts_lock = threading.Lock()
+_MAX_LOCAL_LOGIN_IPS = 4096
 _intelligence_attempts: dict[str, list[float]] = {}
 _intelligence_attempts_lock = threading.Lock()
 
@@ -133,51 +134,62 @@ def _database_call(function, *args, **kwargs):
 
 
 def _permit_login(ip_address: str) -> bool:
-    key = f"postguard:v1:admin-login:{hashlib.sha256(ip_address.encode('utf-8')).hexdigest()}"
-    try:
-        allowed = bool(redis_client.eval(
-            _LOGIN_RATE_LIMIT_SCRIPT,
-            1,
-            key,
-            settings.admin_login_window_seconds,
-            settings.admin_login_attempts,
-        ))
-    except redis.RedisError as exc:
-        if settings.app_environment == "production":
+    if settings.app_environment == "production":
+        key = f"postguard:v1:admin-login:{hashlib.sha256(ip_address.encode('utf-8')).hexdigest()}"
+        try:
+            return bool(redis_client.eval(
+                _LOGIN_RATE_LIMIT_SCRIPT,
+                1,
+                key,
+                settings.admin_login_window_seconds,
+                settings.admin_login_attempts,
+            ))
+        except redis.RedisError as exc:
             logger.error("Admin login rate-limiting failed closed; Redis is unavailable in production.", exc_info=exc)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "login_rate_limit_unavailable", "message": "The login rate limiter is temporarily unavailable."},
             ) from exc
 
-        logger.warning("Admin login Redis rate limit is unavailable; falling back to in-memory throttling for local execution.")
-        now = time.monotonic()
-        with _login_attempts_lock:
-            attempts = [item for item in _login_attempts.get(ip_address, []) if now - item < settings.admin_login_window_seconds]
-            if len(attempts) >= settings.admin_login_attempts:
-                _login_attempts[ip_address] = attempts
-                return False
-            attempts.append(now)
-            _login_attempts[ip_address] = attempts
-            return True
+    if settings.app_environment != "development":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "login_rate_limit_unavailable", "message": "The login rate limiter is temporarily unavailable."},
+        )
 
+    now = time.monotonic()
+    cutoff = now - settings.admin_login_window_seconds
     with _login_attempts_lock:
-        attempts = [item for item in _login_attempts.get(ip_address, []) if time.monotonic() - item < settings.admin_login_window_seconds]
-        attempts.append(time.monotonic())
-        if len(attempts) > settings.admin_login_attempts:
-            attempts = attempts[-settings.admin_login_attempts:]
-        _login_attempts[ip_address] = attempts
-    return allowed
+        for address, attempts in tuple(_login_attempts.items()):
+            active_attempts = [attempt for attempt in attempts if attempt > cutoff]
+            if active_attempts:
+                _login_attempts[address] = active_attempts
+            else:
+                del _login_attempts[address]
+
+        attempts = _login_attempts.get(ip_address)
+        if attempts is not None and len(attempts) >= settings.admin_login_attempts:
+            return False
+
+        if attempts is None:
+            if len(_login_attempts) >= _MAX_LOCAL_LOGIN_IPS:
+                del _login_attempts[next(iter(_login_attempts))]
+            attempts = []
+            _login_attempts[ip_address] = attempts
+        attempts.append(now)
+        return True
 
 
 def _clear_login_attempts(ip_address: str) -> None:
-    key = f"postguard:v1:admin-login:{hashlib.sha256(ip_address.encode('utf-8')).hexdigest()}"
-    with _login_attempts_lock:
-        _login_attempts.pop(ip_address, None)
-    try:
-        redis_client.delete(key)
-    except redis.RedisError:
-        logger.warning("Failed to clear admin login rate-limit counter for %s after a successful login.", ip_address)
+    if settings.app_environment == "production":
+        key = f"postguard:v1:admin-login:{hashlib.sha256(ip_address.encode('utf-8')).hexdigest()}"
+        try:
+            redis_client.delete(key)
+        except redis.RedisError:
+            logger.warning("Failed to clear admin login rate-limit counter for %s after a successful login.", ip_address)
+    elif settings.app_environment == "development":
+        with _login_attempts_lock:
+            _login_attempts.pop(ip_address, None)
 
 
 def _remote_address(request: Request) -> str:
