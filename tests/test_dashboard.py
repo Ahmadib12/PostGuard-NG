@@ -268,6 +268,36 @@ class DashboardAPITests(unittest.IsolatedAsyncioTestCase):
         finally:
             object.__setattr__(settings, "app_environment", original_environment)
 
+    def test_intelligence_rate_limit_enforces_three_requests_per_minute(self):
+        admin_api._intelligence_attempts.clear()
+        try:
+            for _ in range(3):
+                self.assertTrue(admin_api._permit_intelligence("admin-one"))
+            self.assertFalse(admin_api._permit_intelligence("admin-one"))
+        finally:
+            admin_api._intelligence_attempts.clear()
+
+    def test_intelligence_rate_limit_cleans_expired_admin_entries(self):
+        admin_api._intelligence_attempts.clear()
+        try:
+            admin_api._intelligence_attempts["expired-admin"] = [
+                time.monotonic() - 61
+            ]
+            self.assertTrue(admin_api._permit_intelligence("active-admin"))
+            self.assertNotIn("expired-admin", admin_api._intelligence_attempts)
+        finally:
+            admin_api._intelligence_attempts.clear()
+
+    def test_intelligence_rate_limit_bounds_unique_admin_storage(self):
+        admin_api._intelligence_attempts.clear()
+        try:
+            with patch.object(admin_api, "_MAX_INTELLIGENCE_ADMINS", 32):
+                for index in range(128):
+                    self.assertTrue(admin_api._permit_intelligence(f"admin-{index}"))
+                self.assertEqual(len(admin_api._intelligence_attempts), 32)
+        finally:
+            admin_api._intelligence_attempts.clear()
+
     async def test_login_throttle_uses_forwarded_ip_only_for_configured_proxy(self):
         original_proxies = settings.trusted_proxies
         object.__setattr__(settings, "trusted_proxies", ("172.30.0.0/24",))
