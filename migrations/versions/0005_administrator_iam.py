@@ -7,7 +7,7 @@ import sqlalchemy as sa
 
 
 revision = "0005_administrator_iam"
-down_revision = "0004_validate_legacy_tenant_scopes"
+down_revision = "0004_validate_tenant_scopes"
 branch_labels = None
 depends_on = None
 

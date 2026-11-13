@@ -11,7 +11,7 @@ RUN groupadd --system --gid 10001 postguard \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
 
-COPY --chown=postguard:postguard app.py admin_api.py config.py dashboard_store.py security.py ./
+COPY --chown=postguard:postguard app.py admin_api.py config.py dashboard_store.py iam.py intelligence.py security.py ./
 COPY --chown=postguard:postguard migrations/ ./migrations/
 COPY --chown=postguard:postguard alembic.ini ./
 
