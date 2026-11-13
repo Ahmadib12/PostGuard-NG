@@ -54,6 +54,7 @@ CSRF_COOKIE = "postguard_admin_csrf"
 _login_attempts: dict[str, list[float]] = {}
 _login_attempts_lock = threading.Lock()
 _MAX_LOCAL_LOGIN_IPS = 4096
+_MAX_INTELLIGENCE_ADMINS = 4096
 _intelligence_attempts: dict[str, list[float]] = {}
 _intelligence_attempts_lock = threading.Lock()
 
@@ -98,13 +99,27 @@ class OrganizationCreateBody(BaseModel):
 def _permit_intelligence(admin_id: str) -> bool:
     now = time.monotonic()
     with _intelligence_attempts_lock:
-        attempts = [
-            item for item in _intelligence_attempts.get(admin_id, [])
-            if now - item < 60
-        ]
+        for stored_admin_id, stored_attempts in tuple(_intelligence_attempts.items()):
+            active_attempts = [item for item in stored_attempts if now - item < 60]
+            if active_attempts:
+                _intelligence_attempts[stored_admin_id] = active_attempts
+            else:
+                del _intelligence_attempts[stored_admin_id]
+
+        attempts = _intelligence_attempts.get(admin_id)
+        if attempts is None:
+            if len(_intelligence_attempts) >= _MAX_INTELLIGENCE_ADMINS:
+                oldest_admin_id = min(
+                    _intelligence_attempts,
+                    key=lambda key: _intelligence_attempts[key][-1],
+                )
+                del _intelligence_attempts[oldest_admin_id]
+            attempts = []
+
         if len(attempts) >= 3:
             _intelligence_attempts[admin_id] = attempts
             return False
+
         attempts.append(now)
         _intelligence_attempts[admin_id] = attempts
         return True
