@@ -277,7 +277,7 @@ Example request body:
 - The upstream integration is mock-first and should not be described as a production NIPOST implementation until official documentation and credentials are available.
 - Geo checks remain advisory and do not constitute definitive fraud detection.
 - Live upstream reachability is not continuously probed; health reports `not_checked` when live mode is configured. Mock mode is labeled distinctly.
-- Administrator login throttling is in-process and should be paired with edge-level rate limiting when running multiple application workers.
+- Administrator login throttling uses atomic Redis counters in production and fails closed if Redis is unavailable. Development uses a bounded in-process fallback and is not shared across workers.
 - The application is hardened for a secure internal deployment model, but it is not a complete production environment by itself.
 
 ## Future roadmap
