@@ -26,7 +26,7 @@ class SecureQueryAPITests(unittest.IsolatedAsyncioTestCase):
         await self.lifespan.__aenter__()
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
-            base_url="http://test",
+            base_url="http://localhost",
         )
 
     async def asyncTearDown(self):

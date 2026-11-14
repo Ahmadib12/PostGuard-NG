@@ -9,3 +9,4 @@ postguard_dashboard.db
 postguard_dashboard.db-*
 *.tsbuildinfo
 dump.rdb
+dashboard/.venv/

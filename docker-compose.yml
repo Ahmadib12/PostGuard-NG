@@ -55,7 +55,7 @@ services:
         condition: service_healthy
     networks:
       default:
-        ipv4_address: 172.30.0.2
+        ipv4_address: 172.30.0.5
     read_only: true
     tmpfs:
       - /tmp

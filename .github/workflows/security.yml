@@ -45,3 +45,51 @@ jobs:
       - name: Audit dashboard dependencies
         working-directory: dashboard
         run: npm audit --audit-level=high
+      - name: Build and smoke-test backend image
+        run: |
+          set -euo pipefail
+          image=postguard-ng:ci
+          network=postguard-ci
+          docker network create "$network"
+          cleanup() {
+            docker rm -f postguard-ci-app postguard-ci-redis >/dev/null 2>&1 || true
+            docker network rm "$network" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker build --tag "$image" .
+          docker run --detach --name postguard-ci-redis --network "$network" redis:7-alpine
+          docker run --detach \
+            --name postguard-ci-app \
+            --network "$network" \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges:true \
+            --env APP_ENV=production \
+            --env MOCK_NIPOST=true \
+            --env TRUSTED_HOSTS=localhost \
+            --env REDIS_URL=redis://postguard-ci-redis:6379/0 \
+            --env DASHBOARD_DATABASE_URL=sqlite:///:memory: \
+            --env ADMIN_USERNAME=ci-admin \
+            --env ADMIN_PASSWORD=ci-smoke-password-long-enough \
+            --env ADMIN_COOKIE_SECURE=true \
+            --env POSTGUARD_DEMO_CLIENT_SECRET=ci-demo-secret-with-at-least-32-bytes \
+            --env POSTGUARD_PARTNER_X_SECRET=ci-partner-secret-with-at-least-32-bytes \
+            "$image"
+
+          for attempt in $(seq 1 45); do
+            health=$(docker inspect --format='{{.State.Health.Status}}' postguard-ci-app)
+            if [ "$health" = healthy ]; then
+              echo "Backend container started and passed its health check."
+              exit 0
+            fi
+            if [ "$health" = unhealthy ]; then
+              docker logs postguard-ci-app
+              exit 1
+            fi
+            sleep 2
+          done
+          docker logs postguard-ci-app
+          echo "Backend container did not become healthy in time."
+          exit 1

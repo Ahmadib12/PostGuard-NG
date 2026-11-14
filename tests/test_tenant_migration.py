@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.exc import IntegrityError
 
@@ -53,6 +55,22 @@ class TenantMigrationTests(unittest.TestCase):
     def run_migration(self, migration):
         with Operations.context(MigrationContext.configure(self.connection)):
             migration.upgrade()
+
+    def test_migration_revision_identifiers_fit_alembic_version_and_graph_resolves(self):
+        script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
+        revisions = {revision.revision: revision for revision in script.walk_revisions()}
+
+        self.assertEqual(script.get_current_head(), MIGRATION_0006.revision)
+        for revision_id in revisions:
+            self.assertLessEqual(
+                len(revision_id),
+                32,
+                f"Migration revision {revision_id!r} exceeds alembic_version.version_num.",
+            )
+        self.assertEqual(
+            revisions[MIGRATION_0005.revision].down_revision,
+            MIGRATION_0004.revision,
+        )
 
     def insert_legacy_data(self):
         self.connection.execute(text(

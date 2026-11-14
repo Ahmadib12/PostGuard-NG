@@ -5,7 +5,7 @@ import re
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0004_validate_legacy_tenant_scopes"
+revision = "0004_validate_tenant_scopes"
 down_revision = "0003_organization_scopes"
 branch_labels = None
 depends_on = None
